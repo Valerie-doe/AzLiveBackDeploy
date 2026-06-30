@@ -1,52 +1,17 @@
-# Configuration MediaMTX pour AZLive — pont WebRTC (navigateur) -> RTMPS (Facebook Live)
-#
-# Le navigateur du vendeur publie sa webcam en WebRTC (WHIP) vers MediaMTX.
-# Django provisionne dynamiquement un "path" par live (via l'API de contrôle) ;
-# ce path lance ffmpeg (runOnReady) qui relaie le flux vers secure_stream_url de Facebook.
-# L'authentification de chaque publication est déléguée à Django (authHTTPAddress).
-
-###############################################
-# Général
 logLevel: info
-logDestinations: [stdout]
 
-# Lire/écrire la configuration des paths à chaud via l'API de contrôle.
 api: yes
-apiAddress: :9997
 
-###############################################
-# Authentification déléguée à Django.
-# MediaMTX appelle cette URL pour autoriser chaque action (publish/read...).
-# host.docker.internal pointe vers la machine hôte depuis le conteneur.
-authMethod: http
-authHTTPAddress: http://host.docker.internal:8000/api/media/auth/
-# On n'authentifie pas les appels à l'API de contrôle (réservée au backend en local).
-authHTTPExclude:
-  - action: api
-  - action: metrics
-  - action: pprof
+rtmp: yes
+rtmpAddress: :1935
 
-###############################################
-# WebRTC (entrée WHIP depuis le navigateur)
+hls: yes
+hlsAddress: :8888
+
 webrtc: yes
 webrtcAddress: :8889
-# En production, renseigner les adresses IP publiques / serveurs ICE :
-# webrtcAdditionalHosts: [VOTRE_IP_PUBLIQUE]
-# webrtcICEServers2:
-#   - url: stun:stun.l.google.com:19302
 
-###############################################
-# RTSP : utilisé en interne par ffmpeg pour relire le flux publié (rtsp://localhost:8554/<path>)
-rtsp: yes
-rtspAddress: :8554
 
-# RTMP/HLS désactivés : on n'en a pas besoin pour ce pont.
-rtmp: no
-hls: no
-srt: no
-
-###############################################
-# Aucun path statique : ils sont tous créés dynamiquement par Django via l'API.
-# On ne définit PAS de catch-all "all_others" pour qu'une publication vers un path
-# non provisionné soit refusée.
-paths: {}
+paths:
+  live:
+    source: publisher
