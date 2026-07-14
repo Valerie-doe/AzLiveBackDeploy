@@ -23,10 +23,12 @@ from .tiktok_oauth import (
     TikTokOAuthError,
     authenticate_with_access_token as tiktok_authenticate_with_access_token,
     authenticate_with_code as tiktok_authenticate_with_code,
+    authenticate_public_client_with_code,
     build_oauth_url as build_tiktok_oauth_url,
     generate_oauth_state as generate_tiktok_oauth_state,
     tiktok_configured,
 )
+from .public_form_views import _public_order_frontend_url
 
 
 def _auth_payload(vendeur, user, created, token):
@@ -240,6 +242,13 @@ class TikTokCallbackAPIView(APIView):
         state = request.query_params.get('state')
         if not code:
             return Response({'detail': 'Le paramètre code est requis.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Flux client public (formulaire /commander/<live>) : même redirect_uri TikTok que le vendeur.
+        try:
+            live_id, handle = authenticate_public_client_with_code(code, state)
+            return HttpResponseRedirect(_public_order_frontend_url(live_id, handle=handle))
+        except TikTokOAuthError:
+            pass
 
         try:
             vendeur, user, created, token = tiktok_authenticate_with_code(code, state)

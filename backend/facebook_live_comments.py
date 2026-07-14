@@ -45,6 +45,71 @@ def _fetch_live_comments(live_video_id: str, access_token: str) -> list[dict[str
     return []
 
 
+def _fetch_comment_author(comment_id: str, access_token: str) -> dict[str, str]:
+    """Tente de récupérer l'auteur d'un commentaire (souvent masqué dans le listing live)."""
+    try:
+        payload = _graph_request(
+            comment_id,
+            {
+                'access_token': access_token,
+                'fields': 'from{id,name}',
+            },
+            method='GET',
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.info('Impossible de résoudre l\'auteur du commentaire %s: %s', comment_id, exc)
+        return {}
+
+    sender = (payload or {}).get('from') or {}
+    sender_id = str(sender.get('id') or '')
+    if not sender_id:
+        return {}
+    return {
+        'id': sender_id,
+        'name': sender.get('name') or 'Client Facebook',
+    }
+
+
+def resolve_comment_sender(
+    comment: dict[str, Any],
+    *,
+    access_token: str,
+    page_id: str | None = None,
+) -> tuple[str, str, bool]:
+    """Retourne (sender_id, sender_name, author_resolved).
+
+    Si Meta masque `from` (admins, app Dev, privacy), on retombe sur un id stable
+    dérivé du commentaire pour ne pas perdre le JP. La private_reply utilise comment_id.
+    """
+    sender = comment.get('from') or {}
+    sender_id = str(sender.get('id') or '')
+    sender_name = sender.get('name') or 'Client Facebook'
+    if sender_id:
+        return sender_id, sender_name, True
+
+    comment_id = str(comment.get('id') or '')
+    if comment_id and access_token:
+        fetched = _fetch_comment_author(comment_id, access_token)
+        if fetched.get('id'):
+            return fetched['id'], fetched.get('name') or 'Client Facebook', True
+
+    # Fallback : permet aux admins / auteurs masqués de JP quand même.
+    # Préfixe distinct pour ne pas collisionner avec un vrai PSID.
+    if comment_id:
+        fallback_id = f'fb_comment:{comment_id}'
+        fallback_name = 'Client Facebook (auteur masqué)'
+        if page_id:
+            fallback_name = f'Client Facebook (page {page_id})'
+        logger.warning(
+            'Auteur masqué pour commentaire %s — capture JP avec id de repli %s',
+            comment_id,
+            fallback_id,
+        )
+        return fallback_id, fallback_name, False
+
+    return '', 'Client Facebook', False
+
+
 class _FacebookCommentListener(threading.Thread):
     daemon = True
 
@@ -65,10 +130,21 @@ class _FacebookCommentListener(threading.Thread):
         self._seen_ids: set[str] = set()
 
     def run(self):
-        while not self.stop_event.is_set():
-            self._poll_once()
-            if self.stop_event.wait(POLL_INTERVAL_SECONDS):
-                break
+        logger.info('Poller commentaires Facebook démarré (live #%s)', self.live_id)
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    self._poll_once()
+                except Exception as exc:  # noqa: BLE001 — garder le thread vivant
+                    logger.exception(
+                        'Erreur inattendue poller FB (live #%s): %s',
+                        self.live_id,
+                        exc,
+                    )
+                if self.stop_event.wait(POLL_INTERVAL_SECONDS):
+                    break
+        finally:
+            logger.info('Poller commentaires Facebook arrêté (live #%s)', self.live_id)
 
     def _poll_once(self):
         close_old_connections()
@@ -96,12 +172,21 @@ class _FacebookCommentListener(threading.Thread):
                 continue
             self._seen_ids.add(comment_id)
 
-            sender = comment.get('from') or {}
-            sender_id = str(sender.get('id') or '')
-            sender_name = sender.get('name') or 'Client Facebook'
             message = comment.get('message') or ''
-            if not sender_id or not message:
-                # Auteur masqué (confidentialité / hors rôle app) ou commentaire vide.
+            if not message:
+                continue
+
+            sender_id, sender_name, _author_resolved = resolve_comment_sender(
+                comment,
+                access_token=self.access_token,
+                page_id=self.page_id,
+            )
+            if not sender_id:
+                logger.warning(
+                    'Commentaire FB sans id exploitable ignoré (live #%s, commentaire %s)',
+                    self.live_id,
+                    comment_id,
+                )
                 continue
 
             try:
@@ -116,15 +201,29 @@ class _FacebookCommentListener(threading.Thread):
                     id_field='facebook_id',
                     comment_id=comment_id,
                 )
-                if result.get('status') != 'ignored':
+                status = result.get('status')
+                if status == 'ignored':
+                    logger.info(
+                        'Commentaire FB ignoré (live #%s, %s): intent=%s source=%s',
+                        self.live_id,
+                        comment_id,
+                        (result.get('ai_analysis') or {}).get('intent'),
+                        (result.get('ai_analysis') or {}).get('source'),
+                    )
+                else:
                     logger.info(
                         'JP Facebook capturé (live #%s, commentaire %s): %s',
                         self.live_id,
                         comment_id,
-                        result.get('status'),
+                        status,
                     )
             except JPCaptureError as exc:
-                logger.info('Commentaire FB non capturé (live #%s): %s', self.live_id, exc.message)
+                logger.info(
+                    'Commentaire FB non capturé (live #%s): %s — analysis=%s',
+                    self.live_id,
+                    exc.message,
+                    (exc.payload or {}).get('ai_analysis'),
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning('Erreur capture JP Facebook (live #%s): %s', self.live_id, exc)
 
@@ -205,3 +304,42 @@ def listener_status(live_id: int) -> dict[str, Any]:
             'live_video_id': listener.live_video_id,
             'thread': listener.name,
         }
+
+
+def ensure_facebook_comment_listener(live: Live) -> bool:
+    """Démarre le poller s'il est absent ou mort (ex. après reload Django)."""
+    if live.statut != Live.STATUT_EN_COURS or live.vendeur.is_demo_mode:
+        return False
+    if listener_status(live.pk).get('running'):
+        return True
+    broadcasts = list((live.diffusion_plateformes or {}).get('facebook') or [])
+    if not broadcasts:
+        return False
+    from .facebook_live import resolve_live_pages
+
+    pages = resolve_live_pages(live)
+    return start_facebook_comment_listener(live, broadcasts, pages)
+
+
+def recover_facebook_comment_listeners() -> int:
+    """Redémarre les pollers pour les lives encore « en cours » (ex. après reload runserver).
+
+    Les threads daemon ne survivent pas au redémarrage de Django : sans cet appel,
+    les commentaires Facebook ne sont plus lus tant qu'on ne redémarre pas le live.
+    """
+    from .facebook_live import resolve_live_pages
+
+    restarted = 0
+    lives = Live.objects.filter(statut=Live.STATUT_EN_COURS).select_related('vendeur')
+    for live in lives:
+        with _listeners_lock:
+            existing = _listeners.get(live.pk)
+            if existing and existing.is_alive():
+                continue
+        broadcasts = list((live.diffusion_plateformes or {}).get('facebook') or [])
+        if not broadcasts:
+            continue
+        pages = resolve_live_pages(live)
+        if start_facebook_comment_listener(live, broadcasts, pages):
+            restarted += 1
+    return restarted

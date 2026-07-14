@@ -1,9 +1,9 @@
 from django.db import models, transaction
 from django.db.models import Max
 
-from .ai import JPCommentAnalyzer
+from .ai import HybridCommentAnalyzer
 from .jp_codes import normalize_jp_code
-from .models import Client, Commande, Live, LiveCodeJP, PageFacebook, Produit, Vendeur
+from .models import Client, Commande, Live, LiveCodeJP, PageFacebook, Produit, Variante, Vendeur
 from .order_messaging import send_jp_confirmation_message
 from .serializers import CommandeSerializer
 
@@ -36,7 +36,7 @@ def create_jp_commande(client, produit, live=None, canal='', comment_id=None, va
     """
     reused = False
     with transaction.atomic():
-        existing = (
+        existing_qs = (
             Commande.objects.select_for_update()
             .filter(
                 client=client,
@@ -44,9 +44,12 @@ def create_jp_commande(client, produit, live=None, canal='', comment_id=None, va
                 variante=variante,
                 statut=Commande.STATUT_JP_CAPTURE,
             )
-            .order_by('ordre_jp')
-            .first()
         )
+        # Évite les doublons accidentels sur le *même* live uniquement : une commande JP
+        # en attente d'un live précédent ne doit pas masquer une nouvelle capture.
+        if live is not None:
+            existing_qs = existing_qs.filter(live=live)
+        existing = existing_qs.order_by('ordre_jp').first()
         if existing:
             commande = existing
             reused = True
@@ -76,11 +79,12 @@ def create_jp_commande(client, produit, live=None, canal='', comment_id=None, va
 def _candidate_code(analysis) -> str:
     """Code JP candidat (nu) déduit du commentaire.
 
-    On privilégie le texte tapé après « JP » (product_query) puis le code détecté.
-    normalize_jp_code retire un éventuel préfixe « JP » résiduel (gère l'ancien
-    « JP JPNOIR » -> « NOIR »).
+    On privilégie ``code_jp`` puis le texte brut du commentaire : le LLM remplit
+    souvent ``product_query`` avec le *nom* du produit (« Tee-shirt ») et non le
+    code tapé (« 2 »), ce qui cassait ``resolve_live_variante``.
+    normalize_jp_code retire un éventuel préfixe « JP » résiduel.
     """
-    for key in ('product_query', 'code_jp', 'raw_text'):
+    for key in ('code_jp', 'raw_text', 'product_query'):
         candidate = normalize_jp_code(analysis.get(key))
         if candidate:
             return candidate
@@ -102,7 +106,18 @@ def resolve_live_variante(live, analysis, vendeur=None):
     if vendeur:
         queryset = queryset.filter(variante__produit__vendeur=vendeur)
     mapping = queryset.first()
-    return mapping.variante if mapping else None
+    if mapping:
+        return mapping.variante
+
+    # Fallback : code catalogue (variante.code_jp) parmi le dressing du live.
+    dressing_qs = live.produits_dressing.all()
+    if vendeur:
+        dressing_qs = dressing_qs.filter(vendeur=vendeur)
+    return (
+        Variante.objects.filter(produit__in=dressing_qs, code_jp__iexact=code)
+        .select_related('produit')
+        .first()
+    )
 
 
 def resolve_variante_for_analysis(produit, analysis, live=None):
@@ -192,18 +207,20 @@ def find_produit_for_comment(analysis, vendeur=None, live=None):
 
     match = queryset.filter(
         models.Q(nom__icontains=query)
-        | models.Q(couleur__icontains=query)
-        | models.Q(taille__icontains=query)
-    ).first()
+        | models.Q(variantes__couleur__icontains=query)
+        | models.Q(variantes__taille__icontains=query)
+        | models.Q(variantes__code_jp__icontains=query)
+    ).distinct().first()
     if match:
         return match
 
     for token in [token for token in query.split() if len(token) > 1]:
         match = queryset.filter(
             models.Q(nom__icontains=token)
-            | models.Q(couleur__icontains=token)
-            | models.Q(taille__icontains=token)
-        ).first()
+            | models.Q(variantes__couleur__icontains=token)
+            | models.Q(variantes__taille__icontains=token)
+            | models.Q(variantes__code_jp__icontains=token)
+        ).distinct().first()
         if match:
             return match
 
@@ -239,10 +256,66 @@ def process_social_comment(
         page = PageFacebook.objects.filter(page_id=str(page_id)).first() if page_id else None
         live = resolve_active_live(vendeur, page_id=page_id, page_name=page.nom if page else None)
 
-    analyzer = JPCommentAnalyzer()
-    analysis = analyzer.analyze(comment_text)
+    analyzer = HybridCommentAnalyzer()
+    analysis = analyzer.analyze(comment_text, vendeur=vendeur, live=live)
 
     if analysis.get('intent') != 'achat':
+        from .human_assistance import needs_auto_reply, needs_human_assistance
+
+        if needs_auto_reply(analysis):
+            # Réponse automatique : prix, stock, lieu, salutation
+            from .order_messaging import send_auto_reply_message
+
+            intent = (analysis.get('intent') or '').lower()
+            # Tente de résoudre un produit lié à la question si mentionné
+            produit = find_produit_for_comment(analysis, vendeur=vendeur, live=live) if analysis.get('product_query') else None
+
+            lookup = {id_field: sender_id}
+            defaults = {'nom': sender_name, 'telephone': '', 'adresse': ''}
+            client, created = Client.objects.get_or_create(**lookup, defaults=defaults)
+            placeholder_names = {'Client Live', 'Client Facebook', 'Client TikTok'}
+            if not created and client.nom in placeholder_names and sender_name not in placeholder_names:
+                client.nom = sender_name
+                client.save(update_fields=['nom'])
+
+            outbound = send_auto_reply_message(
+                client,
+                intent,
+                produit=produit,
+                vendeur=vendeur,
+                live=live,
+                comment_id=comment_id,
+                page_id=page_id,
+                canal=channel,
+            )
+            return {
+                'status': 'Réponse automatique envoyée',
+                'intent': intent,
+                'channel': channel,
+                'client_cree': created,
+                'ai_analysis': analysis,
+                'message_client': outbound.get('content'),
+                'message_delivery': outbound.get('delivery'),
+                'live_id': live.id if live else None,
+                'vendeur_id': vendeur.id if vendeur else None,
+            }
+
+        if needs_human_assistance(analysis):
+            from .human_assistance import handle_human_assistance_from_comment
+
+            return handle_human_assistance_from_comment(
+                sender_id=sender_id,
+                sender_name=sender_name,
+                comment_text=comment_text,
+                channel=channel,
+                page_id=page_id,
+                streamer_unique_id=streamer_unique_id,
+                vendeur=vendeur,
+                live=live,
+                id_field=id_field,
+                comment_id=comment_id,
+                analysis=analysis,
+            )
         return {
             'status': 'ignored',
             'detail': 'Commentaire ignoré (intention d\'achat non détectée).',

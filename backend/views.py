@@ -13,6 +13,7 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.permissions import IsAuthenticated, AllowAny
 
 from .ai import JPCommentAnalyzer
+from .message_humanizer import emoji, greeting, pick
 from .models import Client, Commande, Livraison, Livreur, Paiement, Produit, ProduitImage, Vendeur, Message, Collaborateur, Live, LiveCodeJP, Variante, PageFacebook, ParametresPlateforme
 from .serializers import (
     ClientSerializer,
@@ -121,6 +122,17 @@ class CommandeListCreateView(generics.ListCreateAPIView):
 
         if live_id:
             queryset = queryset.filter(live_id=live_id)
+            # Le frontend interroge cette route toutes les 5 s pendant un live : on en profite
+            # pour relancer le poller de commentaires Facebook s'il est mort (reload Django).
+            live = (
+                Live.objects.filter(pk=live_id, statut=Live.STATUT_EN_COURS)
+                .select_related('vendeur')
+                .first()
+            )
+            if live and not live.vendeur.is_demo_mode:
+                from .facebook_live_comments import ensure_facebook_comment_listener
+
+                ensure_facebook_comment_listener(live)
         if client_id:
             queryset = queryset.filter(client_id=client_id)
         if produit_id:
@@ -180,9 +192,13 @@ class JPCaptureAPIView(APIView):
         if ordre_jp == 1:
             message_content = self.build_auto_message(client, produit)
         else:
+            intro = pick([
+                f"{greeting(client.nom)} 😊 Voaray ny JP-nao ho an'ny '{produit.nom}'.",
+                f"{greeting(client.nom)}! Efa azonay ny JP-nao ho an'ny '{produit.nom}'.",
+            ])
             message_content = (
-                f"Salama {client.nom}, tafiditra ao anatin'ny lisitra miandry (liste d'attente) ho an'ny '{produit.nom}' ianao (Laharana faha-{ordre_jp}). "
-                f"Hampilazainay ianao raha misy fahafahana avy amin'ireo nialoha anao."
+                f"{intro} Fa efa misy nanao commande mialoha, ka ao amin'ny liste d'attente "
+                f"ianao izao (numéro {ordre_jp}). Hilazanay anao raha vao misy toerana.{emoji(prob=0.4)}"
             )
 
         message = Message.objects.create(
@@ -248,9 +264,12 @@ class JPCaptureAPIView(APIView):
         return None
 
     def build_auto_message(self, client, produit):
+        demande = pick([
+            "Mba alefaso anay azafady ny anaranao, numéro, adresse ary ny daty hanaterana.",
+            "Mba hahavita ny commande, omeo anay ny anaranao, numéro, adresse ary ny daty hanaterana.",
+        ])
         return (
-            f"Salama {client.nom}, nahazo ny JP-nao amin'ny '{produit.nom}' izahay. "
-            "Mba hafahao ny baikonao amin'ny alalan'ny fandefasana ny: anarana feno, finday, adiresy ary ny daty tianao hanaterana azy."
+            f"{greeting(client.nom)} 😊 Voaray ny JP-nao ho an'ny '{produit.nom}'. {demande}{emoji(prob=0.3)}"
         )
 
 
@@ -360,45 +379,20 @@ class CommandeSearchAPIView(generics.ListAPIView):
 
 
 class JPRelanceAPIView(APIView):
-    MAX_RELANCES = 3
-    permission_classes = [AllowAny]  # MVP — déclenché par le planificateur Cron sans token
+    permission_classes = [AllowAny]
 
     def post(self, request):
         force = request.data.get('force', False) or request.query_params.get('force', 'false').lower() == 'true'
-        commandes_a_relancer = []
-        
-        for commande in Commande.objects.filter(statut=Commande.STATUT_JP_CAPTURE).prefetch_related('messages', 'client', 'produit'):
-            last_message = commande.messages.order_by('-date_envoi').first()
-            if not last_message:
-                continue
-            if last_message.numero_relance >= self.MAX_RELANCES:
-                continue
+        from .jp_relances import process_jp_relances
 
-            if not force:
-                now = timezone.now()
-                if last_message.date_envoi + timedelta(minutes=30) > now:
-                    continue
-
-            relance_num = last_message.numero_relance + 1
-            contenu = self.build_relance_message(commande, relance_num)
-            
-            Message.objects.create(commande=commande, contenu=contenu, numero_relance=relance_num)
-            MessagingService.send_relance_message(commande.client, commande.produit, relance_num)
-
-            commandes_a_relancer.append({
-                'commande_id': commande.id,
-                'client': commande.client.nom,
-                'produit': commande.produit.nom,
-                'numero_relance': relance_num,
-                'contenu': contenu,
-            })
-
-        return Response({'relances': commandes_a_relancer}, status=status.HTTP_200_OK)
-
-    def build_relance_message(self, commande, numero_relance):
-        return (
-            f"Bonjour {commande.client.nom}, ceci est votre relance n°{numero_relance} "
-            f"pour la commande '{commande.produit.nom}'. Merci de confirmer votre adresse et date de livraison."
+        result = process_jp_relances(force=bool(force))
+        return Response(
+            {
+                'relances': result['relances'],
+                'expirations': result['expirations'],
+                'inbox_synced': result['inbox_synced'],
+            },
+            status=status.HTTP_200_OK,
         )
 
 
@@ -721,9 +715,30 @@ class DashboardStatsAPIView(APIView):
 
 
 class LiveListCreateView(generics.ListCreateAPIView):
-    queryset = Live.objects.all().order_by('-date_live')
     serializer_class = LiveSerializer
     permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        queryset = Live.objects.select_related('vendeur').all().order_by('-date_live')
+        vendeur_id = self.request.query_params.get('vendeur_id')
+        if vendeur_id:
+            queryset = queryset.filter(vendeur_id=vendeur_id)
+        return queryset
+
+    def list(self, request, *args, **kwargs):
+        # ?sync=1 → démarre uniquement les scouts WebSocket (0 REST = 0 quota API).
+        if str(request.query_params.get('sync') or '') in {'1', 'true', 'yes'}:
+            vendeur_id = request.query_params.get('vendeur_id')
+            try:
+                from .tiktool_live import ensure_tiktok_scouts
+
+                kwargs_scouts = {}
+                if vendeur_id and str(vendeur_id).isdigit():
+                    kwargs_scouts['vendeur_id'] = int(vendeur_id)
+                ensure_tiktok_scouts(**kwargs_scouts)
+            except Exception:
+                pass
+        return super().list(request, *args, **kwargs)
 
 
 class LiveDetailView(generics.RetrieveUpdateDestroyAPIView):

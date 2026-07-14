@@ -2,6 +2,7 @@ import re
 
 from django.db import models
 
+from .llm_analyzer import LLMCommentAnalyzer, build_live_catalogue
 from .models import Produit, Variante
 
 
@@ -22,15 +23,16 @@ class JPCommentAnalyzer:
     ]
 
     QUANTITY_PATTERN = r'(?P<quantity>\d+)\s*(?:pcs|pi[eè]ces|x|EX|EX\s*)?'
-    COLOR_PATTERN = r'(ROUGE|BLEU|NOIR|BLANC|VERT|JAUNE|ROSE|MARRON|OR|ARGENT)'
-    SIZE_PATTERN = r'(S|M|L|XL|XXL|XS|XXS)'
 
     def analyze(self, comment_text: str) -> dict:
         cleaned = self.normalize(comment_text)
         intent = self.detect_intent(cleaned)
         product_query = self.extract_product_query(cleaned)
-        couleur = self.extract_first(self.COLOR_PATTERN, cleaned)
-        taille = self.extract_first(self.SIZE_PATTERN, cleaned)
+        # Couleur/taille déduites des VRAIES valeurs des variantes en base : ça
+        # s'adapte à n'importe quel type de produit (pas seulement les vêtements)
+        # et à n'importe quelle couleur/taille saisie par le vendeur.
+        couleur = self.extract_attribute(cleaned, 'couleur')
+        taille = self.extract_attribute(cleaned, 'taille')
         quantite = self.extract_first(self.QUANTITY_PATTERN, cleaned)
         match = self.find_best_match(product_query, couleur=couleur, taille=taille)
         produit = match[0] if match else None
@@ -74,6 +76,35 @@ class JPCommentAnalyzer:
         match = re.search(pattern, text)
         if match:
             return match.group(1)
+        return None
+
+    def _known_attribute_values(self, field: str) -> list[str]:
+        """Valeurs distinctes d'un attribut de variante (couleur, taille) en base.
+
+        Mises en cache sur l'instance et triées par longueur décroissante pour
+        privilégier la correspondance la plus spécifique (ex. « XXL » avant « L »).
+        """
+        cache = self.__dict__.setdefault('_attr_cache', {})
+        if field not in cache:
+            values = (
+                Variante.objects.exclude(**{f'{field}__isnull': True})
+                .exclude(**{field: ''})
+                .values_list(field, flat=True)
+                .distinct()
+            )
+            uniques = {value.strip() for value in values if value and value.strip()}
+            cache[field] = sorted(uniques, key=len, reverse=True)
+        return cache[field]
+
+    def extract_attribute(self, cleaned_text: str, field: str) -> str | None:
+        """Trouve dans le texte une couleur/taille existant réellement en base.
+
+        Match par mot entier (insensible à la casse) sur le texte déjà normalisé,
+        et renvoie la valeur telle qu'enregistrée (pour le filtrage en aval).
+        """
+        for value in self._known_attribute_values(field):
+            if re.search(r'\b' + re.escape(value.upper()) + r'\b', cleaned_text):
+                return value
         return None
 
     def clean_query(self, query: str) -> str:
@@ -136,8 +167,54 @@ class JPCommentAnalyzer:
         return match[0] if match else None
 
 
+class HybridCommentAnalyzer:
+    """Analyse hybride : regex d'abord (rapide, gratuit), LLM en repli (malgache).
+
+    Même interface que JPCommentAnalyzer (analyze -> dict). La résolution finale
+    produit/variante contre la base reste faite en aval (jp_capture), donc ni le
+    regex ni le LLM ne peuvent imposer un produit inexistant.
+
+    Stratégie :
+    1. On lance le regex. S'il détecte une intention d'achat ET trouve un produit,
+       c'est un cas net : on s'arrête là (gratuit, fiable).
+    2. Sinon, si le LLM est activé, on lui demande de comprendre le message libre
+       / malgache, en lui fournissant le catalogue réel du live pour l'ancrer.
+    3. Sinon (LLM désactivé), on renvoie le résultat du regex tel quel.
+    """
+
+    REGEX_CONFIANCE = 0.9
+    LOW_CONFIANCE_THRESHOLD = 0.5
+
+    def __init__(self):
+        self.regex = JPCommentAnalyzer()
+        self.llm = LLMCommentAnalyzer()
+
+    def analyze(self, comment_text: str, *, vendeur=None, live=None) -> dict:
+        regex_result = self.regex.analyze(comment_text)
+        regex_result['source'] = 'regex'
+        regex_result['confiance'] = (
+            self.REGEX_CONFIANCE if regex_result.get('produit_id') else None
+        )
+
+        # Cas net traité par le regex : intention d'achat + produit reconnu.
+        if regex_result.get('intent') == 'achat' and regex_result.get('produit_id'):
+            return regex_result
+
+        # Repli LLM (uniquement si configuré) pour le langage libre / malgache.
+        if self.llm.is_enabled():
+            catalogue = build_live_catalogue(vendeur=vendeur, live=live)
+            llm_result = self.llm.analyze(comment_text, catalogue=catalogue)
+            if llm_result and llm_result.get('intent') == 'achat':
+                confiance = llm_result.get('confiance')
+                llm_result['needs_review'] = (
+                    confiance is not None and confiance < self.LOW_CONFIANCE_THRESHOLD
+                )
+                return llm_result
+
+        return regex_result
+
+
 class ConfirmationMessageAnalyzer:
-    """Analyse libre des réponses client — sans format imposé, avec complétion progressive."""
 
     PLACEHOLDER_NAMES = {'Client Live', 'Client Facebook', 'Client TikTok'}
 
@@ -148,13 +225,14 @@ class ConfirmationMessageAnalyzer:
             _looks_like_phone,
             _looks_like_time,
             _normalize_phone,
+            _prepare_confirmation_lines,
             parse_confirmation_text,
         )
 
         parsed = parse_confirmation_text(text)
-        lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
+        lines = _prepare_confirmation_lines(text)
 
-        if client and len(lines) == 1:
+        if client and not parsed and len(lines) == 1:
             parsed = self._infer_single_line(
                 lines[0],
                 client,
@@ -175,6 +253,31 @@ class ConfirmationMessageAnalyzer:
                 _normalize_phone,
                 _is_quantity_line,
             )
+
+        if client and len(lines) == 1:
+            line = lines[0]
+            if (
+                parsed.get('nom') == line
+                and not self._needs_nom(client)
+                and not getattr(client, 'adresse', None)
+                and 'adresse' not in parsed
+                and not _looks_like_phone(line)
+                and not _looks_like_date(line)
+                and not _looks_like_time(line)
+                and not (_is_quantity_line and _is_quantity_line(line))
+            ):
+                parsed = {'adresse': parsed['nom']}
+
+        if (
+            client
+            and parsed.get('nom')
+            and parsed.get('telephone')
+            and not parsed.get('adresse')
+            and not self._needs_nom(client)
+            and parsed.get('nom') != client.nom
+        ):
+            parsed = {**parsed, 'adresse': parsed['nom']}
+            parsed.pop('nom', None)
 
         return {
             'raw_text': text,

@@ -2,6 +2,8 @@ import logging
 import uuid
 from django.utils import timezone
 
+from .message_humanizer import emoji, greeting, pick
+
 logger = logging.getLogger(__name__)
 
 
@@ -11,9 +13,12 @@ class MessagingService:
         """
         Simulates sending the initial JP message via WhatsApp/Messenger in Malagasy.
         """
+        demande = pick([
+            "Mba alefaso anay azafady ny anaranao, numéro, adresse ary ny daty hanaterana.",
+            "Mba hahavita ny commande, omeo anay ny anaranao, numéro, adresse ary ny daty hanaterana.",
+        ])
         message_content = (
-            f"Salama {client.nom}, nahazo ny JP-nao amin'ny '{produit.nom}' izahay. "
-            f"Mba hafahao ny baikonao amin'ny alalan'ny fandefasana ny: anarana feno, finday, adiresy ary ny daty tianao hanaterana azy."
+            f"{greeting(client.nom)} 😊 Voaray ny JP-nao ho an'ny '{produit.nom}'. {demande}{emoji(prob=0.3)}"
         )
         logger.info(f"[SMS/MESSENGER MOCK] Envoyé à {client.telephone or 'Client ID ' + str(client.id)} (Commande #{order_id}) : '{message_content}'")
         print(f"\n [MESSAGING SERVICE] Message envoyé avec succès à {client.nom} ({client.telephone or 'Social Platform'}):")
@@ -26,8 +31,8 @@ class MessagingService:
         Simulates sending a follow-up relance message via Messenger in Malagasy.
         """
         message_content = (
-            f"Salama {client.nom}, fampatsiahivana faha-{numero_relance} ity momba ny baikonao '{produit.nom}'. "
-            f"Mba hafahao ny adiresinao sy ny daty hanaterana azy."
+            f"{greeting(client.nom)}! Fampahatsiahivana kely momba ny commande-nao '{produit.nom}'. "
+            f"Mbola miandry ny adresse-nao sy ny daty hanaterana izahay azafady.{emoji(prob=0.3)}"
         )
         logger.info(f"[SMS/MESSENGER RELANCE MOCK] Relance #{numero_relance} envoyée à {client.telephone or 'Client ID ' + str(client.id)} : '{message_content}'")
         print(f"\n⏰ [MESSAGING SERVICE] Relance #{numero_relance} envoyée à {client.nom} ({client.telephone or 'Social Platform'}):")
@@ -40,8 +45,9 @@ class MessagingService:
         Simulates sending a waiting list notification in Malagasy.
         """
         message_content = (
-            f"Salama {client.nom}, tafiditra ao anatin'ny lisitra miandry (liste d'attente) ho an'ny '{produit.nom}' ianao (Laharana faha-{ordre_jp}). "
-            f"Hampilazainay ianao raha misy fahafahana avy amin'ireo nialoha anao."
+            f"{greeting(client.nom)} 😊 Voaray ny JP-nao ho an'ny '{produit.nom}'. "
+            f"Fa efa misy nanao commande mialoha, ka ao amin'ny liste d'attente ianao izao (numéro {ordre_jp}). "
+            f"Hilazanay anao raha vao misy toerana."
         )
         logger.info(f"[SMS/MESSENGER WAITING MOCK] Envoyé à {client.telephone or 'Client ID ' + str(client.id)} (Commande #{order_id}) : '{message_content}'")
         print(f"\n [MESSAGING SERVICE] Message de liste d'attente envoyé à {client.nom} ({client.telephone or 'Social Platform'}):")
@@ -54,8 +60,8 @@ class MessagingService:
         Simulates sending a promotion notification in Malagasy.
         """
         message_content = (
-            f"Salama {client.nom}, nifindra ho eo amin'ny laharana voalohany (laharana faha-1) ianao izao ho an'ny '{produit.nom}'. "
-            f"Mba hafahao ny baikonao amin'ny alalan'ny fandefasana ny: anarana feno, finday, adiresy ary ny daty tianao hanaterana azy."
+            f"{greeting(client.nom)}, vaovao tsara! Anjaranao izao ho an'ny '{produit.nom}'. "
+            f"Mba alefaso anay azafady ny anaranao, numéro, adresse ary ny daty hanaterana.{emoji(prob=0.3)}"
         )
         logger.info(f"[SMS/MESSENGER PROMOTION MOCK] Envoyé à {client.telephone or 'Client ID ' + str(client.id)} (Commande #{order_id}) : '{message_content}'")
         print(f"\n [MESSAGING SERVICE] Message de promotion envoyé à {client.nom} ({client.telephone or 'Social Platform'}):")

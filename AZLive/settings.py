@@ -45,20 +45,12 @@ if 'test' not in sys.argv:
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-# En production (Railway), définir DJANGO_SECRET_KEY. En local, la valeur par défaut suffit.
-SECRET_KEY = os.environ.get(
-    'DJANGO_SECRET_KEY',
-    'django-insecure-5q3tnh8b$92n8^-abr4icuzsp3ato^6n=k7)0oit3uz&i5+22+',
-)
+SECRET_KEY = 'django-insecure-5q3tnh8b$92n8^-abr4icuzsp3ato^6n=k7)0oit3uz&i5+22+'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-# Local: True par défaut. Prod: poser DJANGO_DEBUG=False.
-DEBUG = os.environ.get('DJANGO_DEBUG', 'True').lower() in ('1', 'true', 'yes', 'on')
+DEBUG = True
 
 ALLOWED_HOSTS = ['*']
-
-# Derrière le proxy HTTPS de Railway/Netlify : reconnaître le schéma d'origine.
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
 # Application definition
@@ -73,13 +65,11 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'rest_framework.authtoken',
-    'backend',
+    'backend.apps.BackendConfig',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    # WhiteNoise sert les fichiers statiques (admin, DRF) en production.
-    'whitenoise.middleware.WhiteNoiseMiddleware',
     "corsheaders.middleware.CorsMiddleware",
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -120,30 +110,16 @@ if 'test' in sys.argv:
         }
     }
 else:
-    # Prod (Supabase) : si DATABASE_URL est défini, il a priorité.
-    # Ex: postgresql://postgres:<pwd>@<host>:5432/postgres
-    _database_url = os.environ.get('DATABASE_URL')
-    if _database_url:
-        import dj_database_url
-
-        DATABASES = {
-            'default': dj_database_url.parse(
-                _database_url,
-                conn_max_age=600,
-                ssl_require=True,
-            )
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ.get('POSTGRES_DB', 'AZLive'),
+            'USER': os.environ.get('POSTGRES_USER', 'postgres'),
+            'PASSWORD': os.environ.get('POSTGRES_PASSWORD', ''),
+            'HOST': os.environ.get('POSTGRES_HOST', 'localhost'),
+            'PORT': os.environ.get('POSTGRES_PORT', '5432'),
         }
-    else:
-        DATABASES = {
-            'default': {
-                'ENGINE': 'django.db.backends.postgresql',
-                'NAME': os.environ.get('POSTGRES_DB', 'AZLive'),
-                'USER': os.environ.get('POSTGRES_USER', 'postgres'),
-                'PASSWORD': os.environ.get('POSTGRES_PASSWORD', ''),
-                'HOST': os.environ.get('POSTGRES_HOST', 'localhost'),
-                'PORT': os.environ.get('POSTGRES_PORT', '5432'),
-            }
-        }
+    }
 
 
 # Password validation
@@ -181,15 +157,6 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
-STATIC_ROOT = BASE_DIR / 'staticfiles'
-STORAGES = {
-    'default': {
-        'BACKEND': 'django.core.files.storage.FileSystemStorage',
-    },
-    'staticfiles': {
-        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
-    },
-}
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
@@ -213,11 +180,6 @@ REST_FRAMEWORK = {
 }
 
 CORS_ALLOW_ALL_ORIGINS = True
-
-# Origines de confiance pour le CSRF (admin/session) en prod, ex :
-# CSRF_TRUSTED_ORIGINS=https://mon-back.up.railway.app,https://mon-site.netlify.app
-_csrf_trusted = os.environ.get('CSRF_TRUSTED_ORIGINS', '')
-CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_trusted.split(',') if o.strip()]
 
 # Facebook OAuth / Graph API
 FACEBOOK_APP_ID = os.environ.get('FACEBOOK_APP_ID', '')
@@ -246,15 +208,40 @@ FACEBOOK_WEBHOOK_FIELDS = os.environ.get(
     'FACEBOOK_WEBHOOK_FIELDS',
     'feed,messages',
 )
+# Timeout / retries des appels Graph API (commentaires live, OAuth, etc.).
+# Augmenter FACEBOOK_GRAPH_TIMEOUT si le réseau est lent (SSL handshake timeout).
+FACEBOOK_GRAPH_TIMEOUT = int(os.environ.get('FACEBOOK_GRAPH_TIMEOUT', '45'))
+FACEBOOK_GRAPH_RETRIES = int(os.environ.get('FACEBOOK_GRAPH_RETRIES', '3'))
 
 # URL publique de l'API (liens facture / étiquette dans les messages privés)
 AZLIVE_PUBLIC_BASE_URL = os.environ.get('AZLIVE_PUBLIC_BASE_URL', 'http://localhost:8000')
+
+# --- Compréhension des commentaires par LLM (repli du regex) ---
+# Désactivé par défaut : sans clé/URL, le pipeline reste 100% regex (gratuit, hermétique).
+# API compatible OpenAI (chat completions). Exemples GRATUITS :
+#   - Groq free tier : BASE_URL=https://api.groq.com/openai/v1, MODEL=llama-3.3-70b-versatile
+#   - Ollama local   : BASE_URL=http://localhost:11434/v1, MODEL=llama3.1 (API_KEY non requise)
+AZLIVE_LLM_ENABLED = os.environ.get('AZLIVE_LLM_ENABLED', 'false').lower() in ('1', 'true', 'yes', 'on')
+AZLIVE_LLM_BASE_URL = os.environ.get('AZLIVE_LLM_BASE_URL', '')
+AZLIVE_LLM_API_KEY = os.environ.get('AZLIVE_LLM_API_KEY', '')
+AZLIVE_LLM_MODEL = os.environ.get('AZLIVE_LLM_MODEL', '')
+AZLIVE_LLM_TIMEOUT = int(os.environ.get('AZLIVE_LLM_TIMEOUT', '12'))
 
 # File d'attente JP : relances + expiration automatique du client en tête.
 # Délai (minutes) sans nouvelle d'un client ÉLIGIBLE (en tête de file) avant une relance.
 AZLIVE_JP_RELANCE_DELAY_MINUTES = int(os.environ.get('AZLIVE_JP_RELANCE_DELAY_MINUTES', '30'))
 # Nombre maximum de relances avant expiration.
 AZLIVE_JP_MAX_RELANCES = int(os.environ.get('AZLIVE_JP_MAX_RELANCES', '3'))
+# Thread daemon au boot Django (plus besoin de cron). false = désactiver.
+AZLIVE_JP_RELANCE_AUTO = os.environ.get('AZLIVE_JP_RELANCE_AUTO', 'true').lower() in (
+    '1', 'true', 'yes', 'on',
+)
+# Fréquence de passage du planificateur (secondes). Le délai réel reste DELAY_MINUTES.
+AZLIVE_JP_RELANCE_POLL_SECONDS = int(os.environ.get('AZLIVE_JP_RELANCE_POLL_SECONDS', '60'))
+
+# Reprise après annulation : réutiliser les infos de la dernière commande annulée
+# seulement si elle date de moins de N heures (évite des données vieilles de semaines/mois).
+AZLIVE_REPRISE_INFO_MAX_HOURS = int(os.environ.get('AZLIVE_REPRISE_INFO_MAX_HOURS', '72'))
 
 # MediaMTX — pont WebRTC (navigateur) -> RTMPS (Facebook Live).
 # Si MEDIAMTX_ENABLED est faux, le démarrage de live garde l'ancien comportement
@@ -283,8 +270,25 @@ TIKTOK_LOGIN_SUCCESS_URL = os.environ.get(
 )
 TIKTOK_OAUTH_SCOPES = os.environ.get('TIKTOK_OAUTH_SCOPES', 'user.info.basic')
 
+# OAuth client public — réutilise TIKTOK_REDIRECT_URI (un seul callback à enregistrer chez TikTok)
+TIKTOK_PUBLIC_REDIRECT_URI = os.environ.get(
+    'TIKTOK_PUBLIC_REDIRECT_URI',
+    TIKTOK_REDIRECT_URI,
+)
+TIKTOK_PUBLIC_OAUTH_SCOPES = os.environ.get(
+    'TIKTOK_PUBLIC_OAUTH_SCOPES',
+    'user.info.basic,user.info.profile',
+)
+# URL du frontend où rediriger le client après connexion TikTok
+AZLIVE_PUBLIC_ORDER_BASE_URL = os.environ.get(
+    'AZLIVE_PUBLIC_ORDER_BASE_URL',
+    'http://localhost:3000',
+)
+
 # TikTools — commentaires live TikTok en temps réel
 TIKTOOL_API_KEY = os.environ.get('TIKTOOL_API_KEY', '')
+# Cookies session TikTok du compte streamer (sessionid + tt-target-idc) pour répondre dans le chat live
+TIKTOK_SESSION_COOKIES = os.environ.get('TIKTOK_SESSION_COOKIES', '')
 
 _extra_hosts = os.environ.get('DJANGO_EXTRA_ALLOWED_HOSTS', '')
 if _extra_hosts:

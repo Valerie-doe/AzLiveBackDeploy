@@ -12,9 +12,31 @@ from .models import PageFacebook
 logger = logging.getLogger(__name__)
 
 
+def _is_test_facebook_recipient(recipient_id: str | None) -> bool:
+    """IDs synthétiques des tests curl — Meta les refuse (#100 recipient invalid)."""
+    value = str(recipient_id or '')
+    if not value:
+        return True
+    if value.startswith(('fb_q', 'fb_test', 'fb_comment:', 'tt_')):
+        return True
+    if not value.isdigit():
+        return True
+    return False
+
+
 def send_facebook_private_message(page: PageFacebook, recipient_id: str, text: str) -> dict:
     if not page.access_token:
         return {'sent': False, 'error': 'Token page manquant.'}
+
+    if _is_test_facebook_recipient(recipient_id):
+        logger.info(
+            '[MESSAGING MOCK] skip Graph API — recipient test %s (page %s)',
+            recipient_id,
+            page.page_id,
+        )
+        print(f'\n [ORDER MESSAGING] Message privé (Facebook MOCK → {recipient_id}):')
+        print(f'   > {text}\n')
+        return {'sent': True, 'channel': 'Facebook', 'mock': True, 'message_id': f'mock_{recipient_id}'}
 
     payload = {
         'recipient': json.dumps({'id': str(recipient_id)}),

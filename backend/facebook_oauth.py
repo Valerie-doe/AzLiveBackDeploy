@@ -1,5 +1,6 @@
 import json
 import secrets
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +28,7 @@ def facebook_configured() -> bool:
     return bool(settings.FACEBOOK_APP_ID and settings.FACEBOOK_APP_SECRET)
 
 
-def _graph_request(path, params=None, access_token=None, method='GET'):
+def _graph_request(path, params=None, access_token=None, method='GET', timeout=None):
     query = dict(params or {})
     if access_token and 'access_token' not in query:
         query['access_token'] = access_token
@@ -47,18 +48,44 @@ def _graph_request(path, params=None, access_token=None, method='GET'):
             url = f'{url}?{urllib.parse.urlencode(query)}'
         request = urllib.request.Request(url, headers=headers, method='GET')
 
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as exc:
+    request_timeout = timeout or getattr(settings, 'FACEBOOK_GRAPH_TIMEOUT', 45)
+    max_retries = max(1, int(getattr(settings, 'FACEBOOK_GRAPH_RETRIES', 3)))
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
         try:
-            payload = json.loads(exc.read().decode('utf-8'))
-            message = payload.get('error', {}).get('message', str(exc))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            message = str(exc)
-        raise FacebookOAuthError(message, status_code=exc.code) from exc
-    except urllib.error.URLError as exc:
-        raise FacebookOAuthError(f'Impossible de contacter Facebook: {exc.reason}', status_code=503) from exc
+            with urllib.request.urlopen(request, timeout=request_timeout) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            try:
+                payload = json.loads(exc.read().decode('utf-8'))
+                message = payload.get('error', {}).get('message', str(exc))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                message = str(exc)
+            raise FacebookOAuthError(message, status_code=exc.code) from exc
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise FacebookOAuthError(
+                f'Impossible de contacter Facebook: {exc.reason}',
+                status_code=503,
+            ) from exc
+        except TimeoutError as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise FacebookOAuthError(
+                f'Impossible de contacter Facebook: délai dépassé ({request_timeout}s)',
+                status_code=503,
+            ) from exc
+
+    raise FacebookOAuthError(
+        f'Impossible de contacter Facebook: {last_error}',
+        status_code=503,
+    )
 
 
 def generate_oauth_state() -> str:
