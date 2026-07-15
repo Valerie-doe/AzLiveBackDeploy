@@ -1009,6 +1009,9 @@ class SocialConnectAPIView(APIView):
             except Exception:
                 pass
         return Response(VendeurSerializer(vendeur).data, status=status.HTTP_200_OK)
+
+
+class SocialDisconnectAPIView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
