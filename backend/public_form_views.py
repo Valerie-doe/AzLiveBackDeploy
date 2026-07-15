@@ -28,6 +28,7 @@ from .order_confirmation import (
     OrderConfirmationError,
     cancel_commande_public,
     confirm_commande_from_message,
+    _missing_confirmation_fields,
     _stock_remaining_for,
 )
 from .tiktok_oauth import (
@@ -61,10 +62,27 @@ def _live_code_map(live: Live, variante_ids) -> dict[int, str]:
 
 def _pending_commandes(live: Live, clients):
     return (
-        Commande.objects.select_related('produit', 'variante')
+        Commande.objects.select_related('produit', 'variante', 'client')
         .filter(live=live, client__in=clients, statut=Commande.STATUT_JP_CAPTURE)
         .order_by('ordre_jp')
     )
+
+
+def _commande_is_eligible(commande: Commande) -> bool:
+    """Assez de stock après les JP devant (même live) pour confirmer maintenant."""
+    remaining = _stock_remaining_for(commande)
+    if remaining is None:
+        return True
+    return remaining >= commande.quantite_effective
+
+
+def _infos_completes(commande: Commande) -> bool:
+    return not _missing_confirmation_fields(commande)
+
+
+def _is_waitlisted_complete(commande: Commande) -> bool:
+    """Infos déjà remplies + pas encore éligible → vraie liste d'attente (ne pas re-afficher le formulaire)."""
+    return _infos_completes(commande) and not _commande_is_eligible(commande)
 
 
 def _serialize_commandes(live: Live, commandes) -> list[dict]:
@@ -76,6 +94,8 @@ def _serialize_commandes(live: Live, commandes) -> list[dict]:
         code = code_map.get(commande.variante_id) or (variante.code_jp if variante else '')
         remaining = _stock_remaining_for(commande)
         stock_actuel = variante.stock if variante else None
+        eligible = _commande_is_eligible(commande)
+        infos_ok = _infos_completes(commande)
         items.append(
             {
                 'commande_id': commande.id,
@@ -88,10 +108,25 @@ def _serialize_commandes(live: Live, commandes) -> list[dict]:
                 'stock_disponible': remaining,
                 'stock_actuel': stock_actuel,
                 'en_rupture': remaining is not None and remaining <= 0,
-                'en_liste_attente': remaining is not None and remaining <= 0,
+                'en_liste_attente': not eligible,
+                'infos_completes': infos_ok,
+                'pret_a_confirmer': eligible and infos_ok,
             }
         )
     return items
+
+
+def _split_pending_commandes(live: Live, clients):
+    """Sépare les JP confirmables / à compléter des JP déjà en liste d'attente."""
+    pending = list(_pending_commandes(live, clients))
+    a_traiter = []
+    en_attente = []
+    for commande in pending:
+        if _is_waitlisted_complete(commande):
+            en_attente.append(commande)
+        else:
+            a_traiter.append(commande)
+    return a_traiter, en_attente
 
 
 class PublicOrderFormAPIView(APIView):
@@ -109,13 +144,29 @@ class PublicOrderFormAPIView(APIView):
         }
 
         if not handle.strip():
-            return Response({**base, 'found': False, 'commandes': []}, status=status.HTTP_200_OK)
+            return Response(
+                {
+                    **base,
+                    'found': False,
+                    'commandes': [],
+                    'commandes_liste_attente': [],
+                },
+                status=status.HTTP_200_OK,
+            )
 
         clients = _match_clients(handle)
         if not clients.exists():
-            return Response({**base, 'found': False, 'commandes': []}, status=status.HTTP_200_OK)
+            return Response(
+                {
+                    **base,
+                    'found': False,
+                    'commandes': [],
+                    'commandes_liste_attente': [],
+                },
+                status=status.HTTP_200_OK,
+            )
 
-        commandes = list(_pending_commandes(live, clients))
+        commandes_a_traiter, commandes_attente = _split_pending_commandes(live, clients)
         client = clients.first()
         return Response(
             {
@@ -125,8 +176,21 @@ class PublicOrderFormAPIView(APIView):
                     'nom': client.nom,
                     'telephone': client.telephone,
                     'adresse': client.adresse,
+                    'date_livraison': (
+                        client.date_livraison_preferee.isoformat()
+                        if client.date_livraison_preferee
+                        else ''
+                    ),
+                    'heure_livraison': (
+                        client.heure_livraison_preferee.strftime('%H:%M')
+                        if client.heure_livraison_preferee
+                        else ''
+                    ),
                 },
-                'commandes': _serialize_commandes(live, commandes),
+                # Uniquement les JP à compléter / à confirmer (stock disponible).
+                'commandes': _serialize_commandes(live, commandes_a_traiter),
+                # Déjà en file d'attente (infos OK, stock pas encore libre) — ne pas re-afficher le formulaire.
+                'commandes_liste_attente': _serialize_commandes(live, commandes_attente),
             },
             status=status.HTTP_200_OK,
         )
@@ -159,7 +223,12 @@ class PublicOrderFormAPIView(APIView):
             )
 
         # Commandes éligibles du client pour ce live (anti-falsification d'ID).
-        allowed = {c.id: c for c in _pending_commandes(live, clients)}
+        # On exclut les JP déjà en liste d'attente (infos OK + pas encore de place).
+        allowed = {
+            c.id: c
+            for c in _pending_commandes(live, clients)
+            if not _is_waitlisted_complete(c)
+        }
 
         parsed_data = {
             'nom': str(data.get('nom')).strip(),

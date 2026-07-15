@@ -29,6 +29,27 @@ TIKTOOL_LIVE_STATUS_URL = 'https://api.tik.tools/webcast/live_status'
 TIKTOOL_ROOM_ID_URL = 'https://api.tik.tools/webcast/room_id'
 TIKTOOL_ROOM_INFO_URL = 'https://api.tik.tools/webcast/room_info'
 
+# Codes TikTools = fin de live explicite (doc v3.2).
+_WS_STREAM_END_CODES = {4005, 4006, 4555, 4404}
+
+# Signaux d'activité pendant un live (viewers, chat, gifts…).
+_LIVE_ACTIVITY_EVENTS = frozenset({
+    'chat',
+    'gift',
+    'member',
+    'like',
+    'social',
+    'follow',
+    'share',
+    'subscribe',
+    'streamStart',
+    'stream_start',
+    'liveStart',
+    'live_start',
+    'roomUserSeq',
+    'WebcastRoomUserSeqMessage',
+})
+
 _listeners: dict[int, '_TikToolLiveListener'] = {}
 _scouts: dict[str, '_TikToolLiveListener'] = {}
 _listeners_lock = threading.Lock()
@@ -680,6 +701,14 @@ def _build_ws_url(unique_id: str) -> str:
 
 
 class _TikToolLiveListener(threading.Thread):
+    """Scout WS : détection début + fin de live TikTok en parallèle.
+
+    Début : roomInfo (avec roomId) / chat / gift / viewers / streamStart → Live en_cours
+    Fin   : streamEnd / control(action=3) / close 4005|4006|4555|4404
+            + si AZLive encore en_cours après reconnect : pas d'activité réelle en 30s
+              (roomInfo handshake ne compte pas comme « encore live »)
+    """
+
     daemon = True
 
     def __init__(
@@ -697,6 +726,13 @@ class _TikToolLiveListener(threading.Thread):
         self.scout = scout
         self._reconnect_delay = 15.0
         self._last_close_code: int | None = None
+        self._session_saw_live = False
+        self._stream_end_event_seen = False
+        # True = on vient de reconnecter avec un Live AZLive encore en_cours :
+        # on attend chat/gift/viewers (pas roomInfo) avant de confirmer qu'il tourne.
+        self._verify_still_live = False
+        self._got_activity_proof = False
+        self._proof_timer: threading.Timer | None = None
 
     def run(self):
         try:
@@ -726,12 +762,22 @@ class _TikToolLiveListener(threading.Thread):
             )
             ws_app.run_forever(ping_interval=30, ping_timeout=10)
 
-            # Backoff : ne jamais retenter toutes les 3s (brûle les 60 WS/h sandbox).
-            delay = self._reconnect_delay
-            if self._last_close_code == 4429 or _tiktool_ws_is_rate_limited():
-                delay = max(delay, tiktool_ws_rate_limit_remaining_seconds(), 600.0)
+            if self._last_close_code in _WS_STREAM_END_CODES or self._stream_end_event_seen:
+                # Fin explicite : retenter bientôt (relance TikTok fréquente).
+                delay = 8.0
+                self._reconnect_delay = 8.0
+            elif self._last_close_code == 4429 or _tiktool_ws_is_rate_limited():
+                delay = max(self._reconnect_delay, tiktool_ws_rate_limit_remaining_seconds(), 600.0)
             else:
-                self._reconnect_delay = min(self._reconnect_delay * 2.0, 600.0)
+                delay = self._reconnect_delay
+                self._reconnect_delay = min(self._reconnect_delay * 1.5, 90.0)
+                # Live AZLive encore ouvert → reconnecter vite pour vérifier / clôturer.
+                try:
+                    close_old_connections()
+                    if _find_active_tiktok_live_for_streamer(self.unique_id):
+                        delay = min(delay, 10.0)
+                except Exception:
+                    pass
 
             logger.info(
                 'TikTools WS reconnexion @%s dans %.0fs (dernier code=%s)',
@@ -742,13 +788,132 @@ class _TikToolLiveListener(threading.Thread):
             if self.stop_event.wait(delay):
                 break
 
+    def _cancel_proof_timer(self) -> None:
+        timer = self._proof_timer
+        self._proof_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _note_activity(self) -> None:
+        """Activité réelle reçue → le live TikTok tourne encore."""
+        self._got_activity_proof = True
+        self._verify_still_live = False
+        self._session_saw_live = True
+        self._stream_end_event_seen = False
+        self._cancel_proof_timer()
+
+    def _schedule_verify_or_end(self, seconds: float = 30.0) -> None:
+        """Après reconnect avec Live AZLive encore ouvert : activité ou clôture.
+
+        roomInfo (handshake) n'annule PAS ce timer — seuls chat/gift/viewers/streamStart.
+        Avant de clôturer : un check REST pour éviter de tuer un live calme.
+        """
+        self._cancel_proof_timer()
+        self._got_activity_proof = False
+        self._verify_still_live = True
+
+        def _check() -> None:
+            try:
+                close_old_connections()
+                if self.stop_event.is_set() or self._got_activity_proof:
+                    return
+                active = _find_active_tiktok_live_for_streamer(self.unique_id)
+                if active is None:
+                    self._verify_still_live = False
+                    return
+
+                # Confirmation REST : ne clôture que si offline clairement.
+                status_hint, _room = _check_live_via_live_status(self.unique_id)
+                if status_hint is True:
+                    logger.info(
+                        'Reconnect @%s : live_status encore True → on garde AZLive #%s',
+                        self.unique_id,
+                        active.pk,
+                    )
+                    self._note_activity()
+                    self.live_id = active.pk
+                    return
+                room_hint = None
+                if not _tiktool_is_rate_limited():
+                    room_hint, _fresh = _check_live_via_room_id(self.unique_id)
+                    if room_hint is True:
+                        logger.info(
+                            'Reconnect @%s : room_id encore alive → on garde AZLive #%s',
+                            self.unique_id,
+                            active.pk,
+                        )
+                        self._note_activity()
+                        self.live_id = active.pk
+                        return
+
+                if status_hint is False or room_hint is False:
+                    logger.warning(
+                        'Reconnect @%s : pas d\'activité WS + offline (status=%s room=%s) '
+                        '→ clôture AZLive #%s',
+                        self.unique_id,
+                        status_hint,
+                        room_hint,
+                        active.pk,
+                    )
+                    self.live_id = active.pk
+                    self._end_live_from_ws_signal('reconnect_no_activity')
+                    return
+
+                # Statut indéterminé (quota / cache) : on ne tue pas ; le watchdog REST réessaiera.
+                logger.info(
+                    'Reconnect @%s : aucune activité mais statut indéterminé '
+                    '(status=%s room=%s) — AZLive #%s laissé en_cours',
+                    self.unique_id,
+                    status_hint,
+                    room_hint,
+                    active.pk,
+                )
+                self._verify_still_live = False
+            except Exception:
+                logger.exception('verify-timeout @%s', self.unique_id)
+
+        self._proof_timer = threading.Timer(seconds, _check)
+        self._proof_timer.daemon = True
+        self._proof_timer.start()
+
     def _on_open(self, _ws):
         self._reconnect_delay = 15.0
         self._last_close_code = None
+        self._stream_end_event_seen = False
         logger.info('TikTools WS connecté (@%s)', self.unique_id)
 
+        try:
+            close_old_connections()
+            active = _find_active_tiktok_live_for_streamer(self.unique_id)
+            if active:
+                # Cas fin / drop WS : on vérifie que TikTok tourne vraiment encore.
+                self.live_id = active.pk
+                self._session_saw_live = True
+                logger.info(
+                    'Scout @%s : live AZLive #%s encore en_cours — '
+                    'attente activité (chat/gift/viewers) 30s',
+                    self.unique_id,
+                    active.pk,
+                )
+                self._schedule_verify_or_end(30.0)
+            else:
+                # Cas début : roomInfo / chat créera le live dès qu'il démarre.
+                self.live_id = None
+                self._session_saw_live = False
+                self._got_activity_proof = False
+                self._verify_still_live = False
+                self._cancel_proof_timer()
+        except Exception:
+            logger.exception('Réattachment live après WS open (@%s)', self.unique_id)
+            self._session_saw_live = False
+            self._verify_still_live = False
+
     def _ensure_live_from_ws_signal(self, reason: str) -> None:
-        """streamStart / chat = preuve de room actif → créer sans gate REST."""
+        """Début (ou confirmation) de live → créer/activer sans gate REST."""
+        self._note_activity()
         try:
             live = ensure_tiktok_live_for_streamer(self.unique_id, already_verified=True)
             if live:
@@ -762,6 +927,34 @@ class _TikToolLiveListener(threading.Thread):
         except Exception:
             logger.exception('ensure live via WS %s (@%s)', reason, self.unique_id)
 
+    def _end_live_from_ws_signal(self, reason: str) -> None:
+        """Fin TikTok → passer le live AZLive en terminé (archives)."""
+        self._cancel_proof_timer()
+        self._verify_still_live = False
+        try:
+            close_old_connections()
+            closed = cloturer_tiktok_lives_for_streamer(self.unique_id, reason=reason)
+            if self.live_id:
+                live = (
+                    Live.objects.filter(pk=self.live_id, statut=Live.STATUT_EN_COURS)
+                    .select_related('vendeur')
+                    .first()
+                )
+                if live and cloturer_tiktok_live(live, reason=reason):
+                    closed += 1
+            self.live_id = None
+            self._session_saw_live = False
+            self._stream_end_event_seen = False
+            self._got_activity_proof = False
+            logger.info(
+                'Fin live TikTok via WS %s (@%s) → %s session(s) clôturée(s)/archivée(s)',
+                reason,
+                self.unique_id,
+                closed,
+            )
+        except Exception:
+            logger.exception('clôture live via WS %s (@%s)', reason, self.unique_id)
+
     def _on_message(self, _ws, message: str):
         close_old_connections()
         try:
@@ -772,8 +965,29 @@ class _TikToolLiveListener(threading.Thread):
         if not isinstance(payload, dict):
             return
 
-        event = str(payload.get('event') or payload.get('type') or '').strip()
+        event = str(payload.get('event') or '').strip()
+        if not event and isinstance(payload.get('data'), dict):
+            event = str(payload['data'].get('type') or '').strip()
         data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+
+        # ——— FIN ———
+        if event in {'streamEnd', 'stream_end', 'liveEnd', 'live_end'}:
+            logger.info('TikTools streamEnd (@%s) data=%s', self.unique_id, data or payload)
+            self._stream_end_event_seen = True
+            self._end_live_from_ws_signal(event)
+            return
+
+        if event == 'control':
+            try:
+                action = int(data.get('action') if data else payload.get('action') or -1)
+            except (TypeError, ValueError):
+                action = -1
+            if action == 3:
+                logger.info('TikTools control action=3 stream end (@%s)', self.unique_id)
+                self._stream_end_event_seen = True
+                self._end_live_from_ws_signal('control_stream_end')
+            return
+
         room_id = (
             payload.get('roomId')
             or payload.get('room_id')
@@ -781,44 +995,51 @@ class _TikToolLiveListener(threading.Thread):
             or data.get('room_id')
         )
 
-        # TikTools envoie roomInfo dès qu'on est branché sur un live RÉEL.
-        # roomId présent = preuve suffisante (doc TikTools "First Message").
-        if event in {
-            'roomInfo',
-            'room_info',
-            'streamStart',
-            'stream_start',
-            'liveStart',
-            'live_start',
-            'WebcastRoomUserSeqMessage',
-            'roomUserSeq',
-        } or (room_id and event not in {'streamEnd', 'stream_end', 'disconnected', 'error'}):
-            if not self.live_id:
+        # ——— DÉBUT via roomInfo ———
+        # Handshake avec roomId = créateur en live (détection qui marchait avant).
+        # Exception : en mode verify_still_live (après reconnect), roomInfo seul
+        # ne prouve PAS que le live continue (TikTools l'envoie à chaque connect).
+        if event in {'roomInfo', 'room_info'}:
+            if self._verify_still_live:
+                logger.debug(
+                    'roomInfo ignoré pendant verify_still_live (@%s roomId=%s)',
+                    self.unique_id,
+                    room_id,
+                )
+                return
+            if not self.live_id and room_id:
+                logger.info(
+                    'TikTools roomInfo → détection début (@%s roomId=%s)',
+                    self.unique_id,
+                    room_id,
+                )
+                self._ensure_live_from_ws_signal('roomInfo')
+            elif self.live_id and room_id:
+                # Même session encore connectée : simple heartbeat soft.
+                self._session_saw_live = True
+            return
+
+        # ——— Activité = début OU confirmation « encore live » ———
+        if event in _LIVE_ACTIVITY_EVENTS and event != 'chat':
+            if not self.live_id or self._verify_still_live:
                 logger.info(
                     'TikTools signal live (@%s event=%s roomId=%s)',
                     self.unique_id,
-                    event or 'roomId',
+                    event,
                     room_id,
                 )
-                self._ensure_live_from_ws_signal(event or 'roomId')
-            if event.startswith('room') or event in {
-                'streamStart',
-                'stream_start',
-                'liveStart',
-                'live_start',
-            }:
-                return
-
-        if event in {'gift', 'member', 'like', 'social'}:
-            if not self.live_id:
                 self._ensure_live_from_ws_signal(event)
+            else:
+                self._note_activity()
             return
 
         if event != 'chat':
             return
 
-        if not self.live_id:
+        if not self.live_id or self._verify_still_live:
             self._ensure_live_from_ws_signal('chat')
+        else:
+            self._note_activity()
 
         event_data = data or {}
         try:
@@ -847,6 +1068,22 @@ class _TikToolLiveListener(threading.Thread):
         reason = str(close_msg or '')
         if close_status_code == 4429 or 'rate limit' in reason.lower():
             _mark_ws_rate_limited(3600.0)
+
+        # Uniquement les codes fin explicites TikTools — PAS 1006 (coupure réseau
+        # fréquente qui tuait la détection de début juste après roomInfo).
+        should_end = (
+            close_status_code in _WS_STREAM_END_CODES
+            or self._stream_end_event_seen
+        )
+
+        if should_end:
+            close_old_connections()
+            self._end_live_from_ws_signal(f'ws_close_{close_status_code}')
+        else:
+            self._cancel_proof_timer()
+            # Sur drop réseau avec live encore ouvert : au prochain open,
+            # verify_still_live + 30s d'activité décidera de clôturer ou non.
+
         logger.info(
             'TikTools WebSocket fermé (@%s / live #%s): %s %s',
             self.unique_id,
@@ -998,6 +1235,201 @@ def _facebook_still_live(live: Live) -> bool:
     return False
 
 
+def _find_active_tiktok_live_for_streamer(unique_id: str) -> Live | None:
+    """Retrouve un live AZLive encore en_cours pour ce @TikTok."""
+    normalized = normalize_tiktok_username(unique_id)
+    vendeur = resolve_vendeur_from_tiktok_username(normalized)
+    if not vendeur:
+        for candidate, uid in iter_connected_tiktok_vendeurs():
+            if uid == normalized:
+                vendeur = candidate
+                break
+    if not vendeur:
+        return None
+
+    for live in (
+        Live.objects.filter(vendeur=vendeur, statut=Live.STATUT_EN_COURS)
+        .select_related('vendeur')
+        .order_by('-date_live')
+    ):
+        if _live_is_tiktok_tracked(live):
+            return live
+        titre = (live.titre or '').lower()
+        if normalized in titre or 'tiktok' in titre:
+            return live
+    return None
+
+
+def _live_is_tiktok_tracked(live: Live) -> bool:
+    tiktok_state = dict((live.diffusion_plateformes or {}).get('tiktok') or {})
+    if not tiktok_state:
+        return False
+    # Toute diffusion TikTok non vide = live suivi (même si is_live_on_tiktok=False).
+    return True
+
+
+def cloturer_tiktok_live(live: Live, *, reason: str = 'tiktok_stream_end') -> bool:
+    """Passe un live AZLive en terminé/archivé quand le direct TikTok s'arrête.
+
+    Si Facebook est encore en live sur la même session, on ne clôture que la
+    partie TikTok (statut AZLive reste en_cours).
+    """
+    if live.statut != Live.STATUT_EN_COURS:
+        return False
+
+    stop_tiktool_listener(live)
+
+    diffusion = dict(live.diffusion_plateformes or {})
+    tiktok_state = dict(diffusion.get('tiktok') or {})
+    tiktok_state.update(
+        {
+            'status': 'ENDED',
+            'is_live_on_tiktok': False,
+            'listener': 'stopped',
+            'ended_reason': reason,
+            'updated_at': timezone.now().isoformat(),
+        }
+    )
+    diffusion['tiktok'] = tiktok_state
+    diffusion['stopped_at'] = timezone.now().isoformat()
+    diffusion['stopped_reason'] = reason
+
+    if _facebook_still_live(live):
+        live.diffusion_plateformes = diffusion
+        live.save(update_fields=['diffusion_plateformes'])
+        logger.info(
+            'TikTok terminé sur live #%s (%s) — Facebook encore live, statut AZLive inchangé',
+            live.pk,
+            reason,
+        )
+        return False
+
+    # Clôture complète : terminé = archivé côté hub (Archives Terminées).
+    try:
+        from .facebook_live_comments import stop_facebook_comment_listener
+
+        stop_facebook_comment_listener(live)
+    except Exception:
+        logger.exception('stop_facebook_comment_listener live #%s', live.pk)
+
+    live.statut = Live.STATUT_TERMINE
+    live.date_fin = timezone.now()
+    live.diffusion_plateformes = diffusion
+    live.save(update_fields=['statut', 'date_fin', 'diffusion_plateformes'])
+    logger.info('Live #%s passé en terminé/archivé (%s)', live.pk, reason)
+    return True
+
+
+def cloturer_tiktok_lives_for_streamer(unique_id: str, *, reason: str = 'tiktok_stream_end') -> int:
+    """Clôture tous les lives en_cours liés à ce @TikTok."""
+    normalized = normalize_tiktok_username(unique_id)
+    vendeur = resolve_vendeur_from_tiktok_username(normalized)
+    if not vendeur:
+        for candidate, uid in iter_connected_tiktok_vendeurs():
+            if uid == normalized:
+                vendeur = candidate
+                break
+    if not vendeur:
+        return 0
+
+    closed = 0
+    active = list(
+        Live.objects.filter(vendeur=vendeur, statut=Live.STATUT_EN_COURS)
+        .select_related('vendeur')
+        .order_by('-date_live')
+    )
+    for live in active:
+        if not _live_is_tiktok_tracked(live):
+            titre = (live.titre or '').lower()
+            if normalized not in titre and 'tiktok' not in titre:
+                continue
+        before = live.statut
+        cloturer_tiktok_live(live, reason=reason)
+        live.refresh_from_db(fields=['statut'])
+        if live.statut == Live.STATUT_TERMINE and before == Live.STATUT_EN_COURS:
+            closed += 1
+        elif before == Live.STATUT_EN_COURS and live.statut == Live.STATUT_EN_COURS:
+            # TikTok marqué ENDED mais FB encore live → compte comme traité côté TikTok
+            tiktok = dict((live.diffusion_plateformes or {}).get('tiktok') or {})
+            if str(tiktok.get('status') or '').upper() == 'ENDED':
+                closed += 1
+    return closed
+
+
+_last_end_reconcile_at: datetime | None = None
+
+
+def reconcile_ended_tiktok_lives(*, min_interval_seconds: float = 60.0) -> int:
+    """Filet : clôture un live AZLive encore en_cours si TikTok est offline.
+
+    Utilisé quand `streamEnd` n'arrive pas. Combine live_status + room_id :
+    - True sur l'un des deux → on laisse tourner
+    - False (et pas de True) → clôture
+    """
+    global _last_end_reconcile_at
+
+    if not tiktool_configured() or _tiktool_is_rate_limited():
+        return 0
+
+    now = timezone.now()
+    if (
+        _last_end_reconcile_at is not None
+        and (now - _last_end_reconcile_at).total_seconds() < max(min_interval_seconds, 45.0)
+    ):
+        return 0
+
+    active = list(
+        Live.objects.filter(statut=Live.STATUT_EN_COURS)
+        .select_related('vendeur')
+        .order_by('vendeur_id', '-date_live')
+    )
+    if not active:
+        return 0
+
+    _last_end_reconcile_at = now
+    closed = 0
+    seen_vendeurs: set[int] = set()
+
+    for live in active:
+        if live.vendeur_id in seen_vendeurs:
+            continue
+        if not _live_is_tiktok_tracked(live):
+            titre = (live.titre or '').lower()
+            if 'tiktok' not in titre:
+                continue
+        unique_id = resolve_vendeur_tiktok_unique_id(live.vendeur)
+        if not unique_id:
+            continue
+        seen_vendeurs.add(live.vendeur_id)
+
+        # 1) live_status (rapide)
+        status_hint, _room = _check_live_via_live_status(unique_id)
+        if status_hint is True:
+            continue
+        if _tiktool_is_rate_limited():
+            break
+
+        # 2) room_id (confirmation)
+        room_hint, _fresh = _check_live_via_room_id(unique_id)
+        if room_hint is True:
+            continue
+
+        # Offline si l'un des deux dit False, et aucun ne dit True.
+        if status_hint is False or room_hint is False:
+            n = cloturer_tiktok_lives_for_streamer(unique_id, reason='tiktok_offline_reconcile')
+            closed += n
+            logger.info(
+                'Reconcile TikTok @%s : offline (status=%s room=%s) → %s live(s) clôturé(s)',
+                unique_id,
+                status_hint,
+                room_hint,
+                n,
+            )
+        if _tiktool_is_rate_limited():
+            break
+    return closed
+
+
 def sync_external_tiktok_lives(
     *,
     min_interval_seconds: float = 120.0,
@@ -1099,43 +1531,16 @@ def sync_external_tiktok_lives(
             continue
 
         if is_live is False:
-            # Offline confirmé (room_id non cached) → clôturer les lives TikTok suivis.
-            active_lives = list(
-                Live.objects.filter(vendeur=vendeur, statut=Live.STATUT_EN_COURS).order_by('-date_live')
-            )
-            for live in active_lives:
-                tiktok_state = dict((live.diffusion_plateformes or {}).get('tiktok') or {})
-                was_tiktok_tracked = bool(
-                    tiktok_state.get('unique_id')
-                    or tiktok_state.get('is_live_on_tiktok')
-                    or str(tiktok_state.get('status') or '').upper()
-                    in {'LIVE', 'PENDING_MANUAL', 'ENDED'}
-                )
-                if not was_tiktok_tracked:
-                    continue
-
-                stop_tiktool_listener(live)
-                diffusion = dict(live.diffusion_plateformes or {})
-                tiktok_state = dict(diffusion.get('tiktok') or {})
-                tiktok_state.update(
-                    {
-                        'status': 'ENDED',
-                        'is_live_on_tiktok': False,
-                        'listener': 'stopped',
-                        'updated_at': timezone.now().isoformat(),
-                    }
-                )
-                diffusion['tiktok'] = tiktok_state
-
-                if not _facebook_still_live(live):
-                    live.statut = Live.STATUT_TERMINE
-                    live.date_fin = timezone.now()
-                    live.diffusion_plateformes = diffusion
-                    live.save(update_fields=['statut', 'date_fin', 'diffusion_plateformes'])
+            # Offline confirmé → clôturer / archiver les lives TikTok suivis.
+            for live in Live.objects.filter(
+                vendeur=vendeur, statut=Live.STATUT_EN_COURS
+            ).order_by('-date_live'):
+                if not _live_is_tiktok_tracked(live):
+                    titre = (live.titre or '').lower()
+                    if normalize_tiktok_username(unique_id) not in titre and 'tiktok' not in titre:
+                        continue
+                if cloturer_tiktok_live(live, reason='tiktok_offline_rest'):
                     stopped += 1
-                else:
-                    live.diffusion_plateformes = diffusion
-                    live.save(update_fields=['diffusion_plateformes'])
             continue
 
         logger.info(

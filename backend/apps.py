@@ -43,9 +43,9 @@ class BackendConfig(AppConfig):
 
         def _recover_listeners_once():
             from .facebook_live_comments import recover_facebook_comment_listeners
-            from .tiktool_live import recover_tiktool_listeners
+            from .tiktool_live import reconcile_ended_tiktok_lives, recover_tiktool_listeners
 
-            # Scouts WS seulement (0 appel REST TikTools → préserve le quota).
+            # Scouts WS (0 REST) + périodiquement clôture si TikTok offline.
             try:
                 recover_facebook_comment_listeners()
             except Exception:
@@ -57,6 +57,13 @@ class BackendConfig(AppConfig):
                     logger.info('Watchdog: %s listener(s) TikTok actifs/relancés', n)
             except Exception:
                 logger.exception('Watchdog: échec recover_tiktool_listeners')
+
+            try:
+                ended = reconcile_ended_tiktok_lives()
+                if ended:
+                    logger.info('Watchdog: %s live(s) TikTok clôturé(s)/archivé(s)', ended)
+            except Exception:
+                logger.exception('Watchdog: échec reconcile_ended_tiktok_lives')
 
         def _watchdog():
             interval = float(os.environ.get('AZLIVE_LISTENER_WATCHDOG_SECONDS', '60'))

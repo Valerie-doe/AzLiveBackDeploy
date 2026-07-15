@@ -2267,7 +2267,16 @@ def promote_queue(produit, variante=None, exclude_pk=None) -> None:
             send_stock_partial_offer_message(commande, available)
             return
 
-        # Place libérée et infos déjà complètes : confirmation automatique (message dédié).
+        # TikTok (formulaire public) : ne pas auto-confirmer.
+        # Le client rouvre /commander/<live> et clique sur Confirmer.
+        client = commande.client
+        if client.tiktok_id and not client.facebook_id and commande.live_id:
+            from .order_messaging import send_public_form_spot_available_message
+
+            send_public_form_spot_available_message(commande)
+            return
+
+        # Messenger / autres canaux : confirmation automatique si infos déjà complètes.
         _finalize_confirmation(commande, promoted=True)
 
 

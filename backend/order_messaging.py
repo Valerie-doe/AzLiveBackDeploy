@@ -14,6 +14,14 @@ def _public_base_url() -> str:
     return getattr(settings, 'AZLIVE_PUBLIC_BASE_URL', 'http://localhost:8000').rstrip('/')
 
 
+def public_order_form_url(live_id: int) -> str:
+    """Lien client du formulaire de confirmation pour un live."""
+    base = getattr(settings, 'AZLIVE_PUBLIC_ORDER_BASE_URL', None) or getattr(
+        settings, 'AZLIVE_PUBLIC_BASE_URL', 'http://localhost:3000'
+    )
+    return f'{str(base).rstrip("/")}/commander/{live_id}'
+
+
 def _document_urls(commande_id: int) -> dict[str, str]:
     base = _public_base_url()
     return {
@@ -299,6 +307,31 @@ def build_waiting_with_info_message(commande: Commande) -> str:
 
 def send_waiting_with_info_message(commande: Commande) -> dict[str, Any]:
     content = build_waiting_with_info_message(commande)
+    delivery = _deliver_private_message(commande, content)
+    return {'content': content, 'delivery': delivery}
+
+
+def build_public_form_spot_available_message(commande: Commande) -> str:
+    """Place libérée pour un client TikTok : il doit reouvrir le lien /commander/."""
+    client = commande.client
+    produit = commande.produit
+    link = public_order_form_url(commande.live_id) if commande.live_id else ''
+    intro = pick(
+        [
+            f"{greeting(client.nom)}! Vaovao tsara: misy toerana malalaka ho an'ny '{produit.nom}'.",
+            f"{thanks()} {first_name(client.nom) or client.nom}! Afaka confirmé-na ny commande-nao '{produit.nom}' izao.",
+        ]
+    )
+    action = (
+        f"Sokafy indray ity rohy confirmation ity mba hanamafisana : {link}"
+        if link
+        else "Sokafy indray ny rohy confirmation nomen'ny mpividy mba hanamafisana ny commande-nao."
+    )
+    return f'{intro} {action}{emoji(prob=0.4)}'
+
+
+def send_public_form_spot_available_message(commande: Commande) -> dict[str, Any]:
+    content = build_public_form_spot_available_message(commande)
     delivery = _deliver_private_message(commande, content)
     return {'content': content, 'delivery': delivery}
 
