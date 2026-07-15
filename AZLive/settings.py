@@ -252,8 +252,9 @@ MEDIAMTX_ENABLED = os.environ.get('MEDIAMTX_ENABLED', 'false').lower() in ('1', 
 MEDIAMTX_API_URL = os.environ.get('MEDIAMTX_API_URL', 'http://localhost:9997')
 # URL WHIP de base donnée au navigateur (doit être joignable par le client, en HTTPS en prod).
 MEDIAMTX_WHIP_BASE_URL = os.environ.get('MEDIAMTX_WHIP_BASE_URL', 'http://localhost:8889')
-# Hôte RTSP que ffmpeg (dans MediaMTX) utilise pour relire le flux publié.
-MEDIAMTX_RTSP_HOST = os.environ.get('MEDIAMTX_RTSP_HOST', 'localhost:8554')
+# Hôte RTSP que ffmpeg (dans le conteneur MediaMTX) utilise pour relire le flux.
+# En prod Railway : 127.0.0.1:8554 (ffmpeg et MediaMTX sont dans le même container).
+MEDIAMTX_RTSP_HOST = os.environ.get('MEDIAMTX_RTSP_HOST', '127.0.0.1:8554')
 # Paramètres d'encodage ffmpeg pour le relais vers Facebook (H.264 + AAC requis).
 MEDIAMTX_FFMPEG_VIDEO_BITRATE = os.environ.get('MEDIAMTX_FFMPEG_VIDEO_BITRATE', '3000k')
 MEDIAMTX_FFMPEG_PRESET = os.environ.get('MEDIAMTX_FFMPEG_PRESET', 'veryfast')

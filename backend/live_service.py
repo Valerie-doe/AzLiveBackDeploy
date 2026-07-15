@@ -84,12 +84,27 @@ def _provision_webrtc(live: Live, facebook_broadcasts: list[dict]) -> dict | Non
         return None
     secure_stream_url = _first_secure_stream_url(facebook_broadcasts)
     if not secure_stream_url:
-        return None
+        return {
+            'status': 'error',
+            'detail': (
+                'Live Facebook créé sans URL RTMPS — impossible de provisionner MediaMTX. '
+                'Vérifiez le token Page et la permission publish_video.'
+            ),
+        }
     try:
         ingest = provision_live_path(live, secure_stream_url)
     except MediaMTXError as exc:
-        # Le live Facebook existe déjà ; on n'échoue pas, mais on signale l'absence de pont.
-        return {'status': 'error', 'detail': exc.message}
+        # Le live Facebook Graph existe déjà, mais sans pont WebRTC aucune vidéo
+        # n'arrive sur Facebook (cas typique Railway sans service MediaMTX).
+        return {
+            'status': 'error',
+            'detail': (
+                f'{exc.message} — sans MediaMTX joignable (MEDIAMTX_API_URL / WHIP HTTPS), '
+                'le navigateur ne peut pas pousser la caméra : Facebook reste sans flux. '
+                'Utilisez OBS avec stream_url, ou déployez MediaMTX.'
+            ),
+            'stream_url': secure_stream_url,
+        }
     return {
         'status': 'ready',
         'path': ingest['path'],

@@ -1,0 +1,11 @@
+# Service MediaMTX — à déployer comme service Railway séparé (pas le backend Django).
+# Dans le dashboard : New → Empty Service → Settings → Root Directory = mediamtx/railway
+# Build : Dockerfile
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
