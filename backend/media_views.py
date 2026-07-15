@@ -144,22 +144,26 @@ class MediaMTXWhipProxyAPIView(APIView):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
+        path = path.strip('/')
         token = request.query_params.get('token') or ''
         auth = request.META.get('HTTP_AUTHORIZATION') or ''
         if not token and auth.lower().startswith('bearer '):
             token = auth[7:].strip()
 
-        target = f'{base}/{path.strip("/")}/whip'
-        if token:
-            target = f'{target}?{urllib.parse.urlencode({"token": token})}'
+        # Sécurité : le token est validé ICI (MediaMTX n'appelle plus authHTTP
+        # publique Railway, qui timeoute en hairpin).
+        if not MediaMTXAuthAPIView._publish_allowed(path, token or None):
+            return Response(
+                {'detail': 'Token WHIP invalide ou live non démarré.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
+        target = f'{base}/{path}/whip'
         body = request.body or b''
         headers = {
             'Content-Type': request.META.get('CONTENT_TYPE') or 'application/sdp',
             'User-Agent': 'AZLive-WHIP-Proxy/1.0',
         }
-        if token:
-            headers['Authorization'] = f'Bearer {token}'
 
         req = urllib.request.Request(target, data=body, headers=headers, method='POST')
         try:

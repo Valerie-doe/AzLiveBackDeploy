@@ -29,9 +29,32 @@ fi
 # Sans schéma + lowercase (les domaines Railway sont en minuscules)
 PUBLIC_HOST=$(printf '%s' "$PUBLIC_HOST_RAW" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/$||' | tr 'A-Z' 'a-z')
 
+# Auth :
+# - Par défaut : auth INTERNE ouverte (publish/read/api).
+#   Sur Railway, authHTTP vers https://…up.railway.app depuis le container TIMEOUT
+#   (hairpin) → WHIP 401. Le token est validé par le proxy Django /api/media/whip/.
+# - Optionnel : MEDIAMTX_AUTH_HTTP=true + MEDIAMTX_AUTH_URL=http://backend.railway.internal:PORT/...
 AUTH_URL="${MEDIAMTX_AUTH_URL:-}"
-if [ -z "$AUTH_URL" ]; then
-  echo "[mediamtx] WARN: MEDIAMTX_AUTH_URL vide — auth ouverte (dev only)" >&2
+AUTH_HTTP="${MEDIAMTX_AUTH_HTTP:-false}"
+if [ "$AUTH_HTTP" = "true" ] && [ -n "$AUTH_URL" ]; then
+  case "$AUTH_URL" in
+    https://*.up.railway.app*|https://*railway.app*)
+      echo "[mediamtx] WARN: AUTH_URL publique Railway → risques de timeout hairpin. Préfère http://….railway.internal:PORT/api/media/auth/" >&2
+      ;;
+  esac
+  AUTH_BLOCK=$(
+    cat <<EOF
+authMethod: http
+authHTTPAddress: ${AUTH_URL}
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+  - action: read
+EOF
+  )
+else
+  echo "[mediamtx] Auth interne ouverte — sécurité WHIP via proxy Django (recommandé Railway)" >&2
   AUTH_BLOCK=$(
     cat <<'EOF'
 authInternalUsers:
@@ -42,17 +65,6 @@ authInternalUsers:
       - action: publish
       - action: read
       - action: playback
-EOF
-  )
-else
-  AUTH_BLOCK=$(
-    cat <<EOF
-authMethod: http
-authHTTPAddress: ${AUTH_URL}
-authHTTPExclude:
-  - action: api
-  - action: metrics
-  - action: pprof
 EOF
   )
 fi
