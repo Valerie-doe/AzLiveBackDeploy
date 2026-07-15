@@ -250,8 +250,20 @@ AZLIVE_REPRISE_INFO_MAX_HOURS = int(os.environ.get('AZLIVE_REPRISE_INFO_MAX_HOUR
 MEDIAMTX_ENABLED = os.environ.get('MEDIAMTX_ENABLED', 'false').lower() in ('1', 'true', 'yes', 'on')
 # API de contrôle de MediaMTX (provisioning des paths). Vue depuis Django.
 MEDIAMTX_API_URL = os.environ.get('MEDIAMTX_API_URL', 'http://localhost:9997')
-# URL WHIP de base donnée au navigateur (doit être joignable par le client, en HTTPS en prod).
+# URL WHIP donnée au navigateur.
+# Sur Railway : laisse l'URL publique Django (proxy /api/media/whip/) car le
+# domaine public MediaMTX renvoie souvent 502. En local : http://localhost:8889
 MEDIAMTX_WHIP_BASE_URL = os.environ.get('MEDIAMTX_WHIP_BASE_URL', 'http://localhost:8889')
+# Force le navigateur à passer par Django même si MEDIAMTX_WHIP_BASE_URL pointe ailleurs.
+MEDIAMTX_WHIP_VIA_DJANGO = os.environ.get('MEDIAMTX_WHIP_VIA_DJANGO', 'true').lower() in (
+    '1', 'true', 'yes', 'on',
+)
+# Base WHIP interne (private networking), joignable uniquement depuis Django.
+# Ex. http://azlivemtxn.railway.internal:8189  (= port WHIP/$PORT des logs MediaMTX)
+MEDIAMTX_WHIP_INTERNAL_BASE = os.environ.get('MEDIAMTX_WHIP_INTERNAL_BASE', '')
+# Si INTERNAL_BASE vide : dérivé de MEDIAMTX_API_URL en remplaçant le port par celui-ci.
+# Sur Railway : mets le $PORT WHIP des logs MediaMTX (ex. 8189).
+MEDIAMTX_WEBRTC_PORT = os.environ.get('MEDIAMTX_WEBRTC_PORT', '8189')
 # Hôte RTSP que ffmpeg (dans le conteneur MediaMTX) utilise pour relire le flux.
 # En prod Railway : 127.0.0.1:8554 (ffmpeg et MediaMTX sont dans le même container).
 MEDIAMTX_RTSP_HOST = os.environ.get('MEDIAMTX_RTSP_HOST', '127.0.0.1:8554')

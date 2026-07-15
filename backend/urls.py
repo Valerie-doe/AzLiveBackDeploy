@@ -48,7 +48,7 @@ from .auth_views import (
 )
 from .webhooks import FacebookWebhookView, TikTokWebhookView
 from .live_views import LiveDemarrerAPIView, LiveArreterAPIView
-from .media_views import MediaMTXAuthAPIView
+from .media_views import MediaMTXAuthAPIView, MediaMTXWhipProxyAPIView
 from .public_form_views import (
     PublicOrderCancelAPIView,
     PublicOrderFormAPIView,
@@ -131,8 +131,9 @@ urlpatterns = [
     path('webhooks/facebook/', FacebookWebhookView.as_view(), name='webhook-facebook'),
     path('webhooks/tiktok/', TikTokWebhookView.as_view(), name='webhook-tiktok'),
 
-    # MediaMTX — authentification des publications WebRTC (diffusion navigateur)
+    # MediaMTX — authentification + proxy WHIP (contournement 502 domaine public MTX)
     path('media/auth/', MediaMTXAuthAPIView.as_view(), name='media-auth'),
+    path('media/whip/<str:path>/', MediaMTXWhipProxyAPIView.as_view(), name='media-whip-proxy'),
 
     # Dashboard
     path('dashboard/stats/', DashboardStatsAPIView.as_view(), name='dashboard-stats'),

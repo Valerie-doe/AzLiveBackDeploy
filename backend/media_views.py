@@ -1,14 +1,17 @@
-"""Endpoint d'authentification appelé par MediaMTX (authHTTPAddress).
+"""MediaMTX : auth HTTP + proxy WHIP (contournement Railway 502 sur le domaine MediaMTX).
 
-MediaMTX appelle cette vue avant chaque action (publish/read...). On autorise :
-- les lectures internes (ffmpeg relit le flux en RTSP local) ;
-- les publications WHIP dont le token correspond à celui provisionné pour le live.
-
-Réponse : 200 = autorisé, 401 = refusé (convention MediaMTX).
+Sur Railway, le domaine public MediaMTX renvoie souvent 502 alors que l'API privée :9997
+fonctionne. Le navigateur passe alors par Django (HTTPS déjà OK) qui relaie le WHIP
+vers MediaMTX en private networking.
 """
 import json
 import logging
+import urllib.error
+import urllib.parse
+import urllib.request
 
+from django.conf import settings
+from django.http import HttpResponse
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -68,9 +71,7 @@ class MediaMTXAuthAPIView(APIView):
     def _token_from_query(query: str | None) -> str | None:
         if not query:
             return None
-        from urllib.parse import parse_qs
-
-        params = parse_qs(query)
+        params = urllib.parse.parse_qs(query)
         for key in ('token', 'pass', 'password'):
             if params.get(key):
                 return params[key][0]
@@ -80,7 +81,6 @@ class MediaMTXAuthAPIView(APIView):
     def _publish_allowed(path: str, token: str | None) -> bool:
         if not path or not token:
             return False
-        # Lookup JSON Field (Postgres) + fallback Python pour robustesse.
         live = (
             Live.objects.filter(statut=Live.STATUT_EN_COURS)
             .filter(diffusion_plateformes__webrtc__path=path)
@@ -100,3 +100,94 @@ class MediaMTXAuthAPIView(APIView):
         if not ok:
             logger.warning('MediaMTX auth: token mismatch path=%s live=%s', path, live.pk)
         return ok
+
+
+def _whip_internal_base() -> str:
+    explicit = (getattr(settings, 'MEDIAMTX_WHIP_INTERNAL_BASE', '') or '').rstrip('/')
+    if explicit:
+        return explicit
+    api = (getattr(settings, 'MEDIAMTX_API_URL', '') or '').rstrip('/')
+    if not api:
+        return ''
+    parsed = urllib.parse.urlparse(api)
+    if not parsed.hostname:
+        return ''
+    port = getattr(settings, 'MEDIAMTX_WEBRTC_PORT', None) or '8889'
+    scheme = parsed.scheme or 'http'
+    return f'{scheme}://{parsed.hostname}:{port}'
+
+
+class MediaMTXWhipProxyAPIView(APIView):
+    """Proxy WHIP : navigateur → Django (HTTPS public) → MediaMTX (réseau privé)."""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def options(self, request, path: str):
+        response = HttpResponse(status=204)
+        response['Access-Control-Allow-Origin'] = '*'
+        response['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        response['Access-Control-Max-Age'] = '86400'
+        return response
+
+    def post(self, request, path: str):
+        base = _whip_internal_base()
+        if not base:
+            return Response(
+                {
+                    'detail': (
+                        'MEDIAMTX_WHIP_INTERNAL_BASE / MEDIAMTX_API_URL non configuré '
+                        'pour le proxy WHIP.'
+                    )
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        token = request.query_params.get('token') or ''
+        auth = request.META.get('HTTP_AUTHORIZATION') or ''
+        if not token and auth.lower().startswith('bearer '):
+            token = auth[7:].strip()
+
+        target = f'{base}/{path.strip("/")}/whip'
+        if token:
+            target = f'{target}?{urllib.parse.urlencode({"token": token})}'
+
+        body = request.body or b''
+        headers = {
+            'Content-Type': request.META.get('CONTENT_TYPE') or 'application/sdp',
+            'User-Agent': 'AZLive-WHIP-Proxy/1.0',
+        }
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+
+        req = urllib.request.Request(target, data=body, headers=headers, method='POST')
+        try:
+            with urllib.request.urlopen(req, timeout=45) as upstream:
+                answer = upstream.read()
+                content_type = upstream.headers.get('Content-Type', 'application/sdp')
+                response = HttpResponse(answer, status=upstream.status, content_type=content_type)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()
+            logger.warning(
+                'WHIP proxy HTTP %s vers %s: %s',
+                exc.code,
+                target,
+                detail[:300],
+            )
+            response = HttpResponse(detail, status=exc.code, content_type='text/plain')
+        except urllib.error.URLError as exc:
+            logger.exception('WHIP proxy injoignable (%s): %s', target, exc.reason)
+            return Response(
+                {
+                    'detail': (
+                        f'MediaMTX WHIP interne injoignable ({exc.reason}). '
+                        'Vérifie MEDIAMTX_WHIP_INTERNAL_BASE '
+                        '(ex. http://azlivemtxn.railway.internal:8189) = port WHIP des logs MediaMTX.'
+                    )
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        response['Access-Control-Allow-Origin'] = '*'
+        return response
