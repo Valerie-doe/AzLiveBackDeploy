@@ -98,9 +98,15 @@ def provision_live_path(live, secure_stream_url: str) -> dict[str, Any]:
     )
 
     whip_base = settings.MEDIAMTX_WHIP_BASE_URL.rstrip('/')
+    # Token aussi en query : plus fiable que Authorization Bearer
+    # (MediaMTX → authHTTP vers Django sur Railway).
+    whip_url = (
+        f'{whip_base}/{path}/whip'
+        f'?token={urllib.parse.quote(publish_token, safe="")}'
+    )
     return {
         'path': path,
-        'whip_url': f'{whip_base}/{path}/whip',
+        'whip_url': whip_url,
         'publish_token': publish_token,
     }
 

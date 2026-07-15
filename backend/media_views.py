@@ -42,13 +42,27 @@ class MediaMTXAuthAPIView(APIView):
             token = (
                 payload.get('token')
                 or payload.get('password')
+                or payload.get('user')
                 or self._token_from_query(payload.get('query'))
+                or self._bearer_from_request(request)
             )
             if self._publish_allowed(path, token):
                 return Response(status=status.HTTP_200_OK)
 
-        logger.warning('MediaMTX auth refusé (action=%s, path=%s)', action, path)
+        logger.warning(
+            'MediaMTX auth refusé (action=%s, path=%s, protocol=%s)',
+            action,
+            path,
+            payload.get('protocol'),
+        )
         return Response({'detail': 'unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    @staticmethod
+    def _bearer_from_request(request) -> str | None:
+        auth = request.META.get('HTTP_AUTHORIZATION') or ''
+        if auth.lower().startswith('bearer '):
+            return auth[7:].strip() or None
+        return None
 
     @staticmethod
     def _token_from_query(query: str | None) -> str | None:
@@ -66,11 +80,23 @@ class MediaMTXAuthAPIView(APIView):
     def _publish_allowed(path: str, token: str | None) -> bool:
         if not path or not token:
             return False
-        live = Live.objects.filter(
-            statut=Live.STATUT_EN_COURS,
-            diffusion_plateformes__webrtc__path=path,
-        ).first()
+        # Lookup JSON Field (Postgres) + fallback Python pour robustesse.
+        live = (
+            Live.objects.filter(statut=Live.STATUT_EN_COURS)
+            .filter(diffusion_plateformes__webrtc__path=path)
+            .first()
+        )
+        if live is None:
+            for candidate in Live.objects.filter(statut=Live.STATUT_EN_COURS).order_by('-id')[:30]:
+                webrtc = (candidate.diffusion_plateformes or {}).get('webrtc') or {}
+                if webrtc.get('path') == path:
+                    live = candidate
+                    break
         if not live:
+            logger.warning('MediaMTX auth: aucun live en_cours pour path=%s', path)
             return False
         expected = (live.diffusion_plateformes or {}).get('webrtc', {}).get('publish_token')
-        return bool(expected) and token == expected
+        ok = bool(expected) and token == expected
+        if not ok:
+            logger.warning('MediaMTX auth: token mismatch path=%s live=%s', path, live.pk)
+        return ok

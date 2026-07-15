@@ -100,6 +100,9 @@ ${ICE_BLOCK}
 rtsp: yes
 rtspAddress: :${RTSP_PORT}
 
+# MoQ inutile pour AZLive et consomme RAM/ports (crash possible sur petit plan Railway).
+moq: no
+
 rtmp: no
 hls: no
 srt: no
