@@ -1,24 +1,37 @@
 #!/bin/sh
 # MediaMTX sur Railway : WHIP/signaling DOIT écouter sur $PORT (sinon 502).
+# ICE TCP/UDP doivent utiliser d'AUTRES ports (sinon "address already in use").
 set -eu
 
 PORT="${PORT:-8889}"
 API_PORT="${MEDIAMTX_API_PORT:-9997}"
 RTSP_PORT="${MEDIAMTX_RTSP_PORT:-8554}"
-ICE_TCP_PORT="${MEDIAMTX_ICE_TCP_PORT:-8189}"
 
-# Hostname public sans schéma (ex. azlivemtxn.up.railway.app)
+# Ports ICE distincts du $PORT Railway (crucial : sinon bind conflict).
+ICE_TCP_PORT="${MEDIAMTX_ICE_TCP_PORT:-8190}"
+ICE_UDP_PORT="${MEDIAMTX_ICE_UDP_PORT:-8191}"
+
+# Si quelqu'un a forcé ICE=8189 alors que PORT=8189 aussi → corrige automatiquement.
+if [ "$ICE_TCP_PORT" = "$PORT" ]; then
+  ICE_TCP_PORT=8190
+  echo "[mediamtx] WARN: ICE_TCP_PORT == PORT ($PORT) → forcé à 8190" >&2
+fi
+if [ "$ICE_UDP_PORT" = "$PORT" ] || [ "$ICE_UDP_PORT" = "$ICE_TCP_PORT" ]; then
+  ICE_UDP_PORT=8191
+  echo "[mediamtx] WARN: ICE_UDP_PORT en conflit → forcé à 8191" >&2
+fi
+
 PUBLIC_HOST_RAW="${MEDIAMTX_PUBLIC_HOST:-}"
 if [ -z "$PUBLIC_HOST_RAW" ]; then
   echo "[mediamtx] ERREUR: MEDIAMTX_PUBLIC_HOST manquant (ex. azlivemtxn.up.railway.app)" >&2
   exit 1
 fi
-PUBLIC_HOST=$(printf '%s' "$PUBLIC_HOST_RAW" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/$||')
+# Sans schéma + lowercase (les domaines Railway sont en minuscules)
+PUBLIC_HOST=$(printf '%s' "$PUBLIC_HOST_RAW" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/$||' | tr 'A-Z' 'a-z')
 
-# Auth Django (réseau privé). Si absent → mode ouvert API-only pour démarrer, publish refusé par défaut.
 AUTH_URL="${MEDIAMTX_AUTH_URL:-}"
 if [ -z "$AUTH_URL" ]; then
-  echo "[mediamtx] WARN: MEDIAMTX_AUTH_URL vide — auth HTTP désactivée (dev only)" >&2
+  echo "[mediamtx] WARN: MEDIAMTX_AUTH_URL vide — auth ouverte (dev only)" >&2
   AUTH_BLOCK=$(
     cat <<'EOF'
 authInternalUsers:
@@ -77,11 +90,11 @@ ${AUTH_BLOCK}
 webrtc: yes
 webrtcAddress: :${PORT}
 webrtcEncryption: no
-webrtcAllowOrigin: "*"
+webrtcAllowOrigins: ["*"]
 webrtcTrustedProxies: [0.0.0.0/0]
 webrtcAdditionalHosts: [${PUBLIC_HOST}]
 webrtcLocalTCPAddress: :${ICE_TCP_PORT}
-webrtcLocalUDPAddress: :${ICE_TCP_PORT}
+webrtcLocalUDPAddress: :${ICE_UDP_PORT}
 ${ICE_BLOCK}
 
 rtsp: yes
@@ -98,14 +111,14 @@ echo "======== MediaMTX Railway ========"
 echo "WHIP/signaling  :0.0.0.0:${PORT}  (Railway public HTTPS)"
 echo "API contrôle    :0.0.0.0:${API_PORT}  (privé railway.internal)"
 echo "RTSP            :0.0.0.0:${RTSP_PORT}"
-echo "ICE TCP/UDP     :0.0.0.0:${ICE_TCP_PORT}"
+echo "ICE TCP         :0.0.0.0:${ICE_TCP_PORT}"
+echo "ICE UDP         :0.0.0.0:${ICE_UDP_PORT}"
 echo "PUBLIC_HOST     ${PUBLIC_HOST}"
 echo "AUTH            ${AUTH_URL:-disabled}"
 echo "Config:"
 cat "$CONFIG_PATH"
 echo "=================================="
 
-# Binary path selon l'image officielle
 if [ -x /mediamtx ]; then
   exec /mediamtx "$CONFIG_PATH"
 elif [ -x /usr/local/bin/mediamtx ]; then
