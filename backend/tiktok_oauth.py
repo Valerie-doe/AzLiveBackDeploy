@@ -130,10 +130,11 @@ def exchange_code_for_tokens(
 
 
 def get_user_profile(access_token: str) -> dict[str, Any]:
-    # username requiert user.info.profile — on ne demande que user.info.basic ici
+    # `username` (= unique_id TikTok, ex. azplus.mg) est requis pour la détection live
+    # via TikTools. Scope `user.info.profile` nécessaire (voir TIKTOK_OAUTH_SCOPES).
     payload = _tiktok_request(
         TIKTOK_USER_INFO_URL,
-        {'fields': 'open_id,union_id,avatar_url,display_name'},
+        {'fields': 'open_id,union_id,avatar_url,display_name,username'},
         bearer_token=access_token,
     )
     error = payload.get('error') or {}
@@ -172,6 +173,10 @@ def get_or_create_vendeur_from_tiktok(profile: dict[str, Any], token_payload: di
         if tiktok_username and _is_valid_handle(tiktok_username):
             existing.tiktok_username = tiktok_username
             update_fields.append('tiktok_username')
+        elif existing.tiktok_username and not _is_valid_handle(existing.tiktok_username):
+            # Ancien display_name / handle invalide : inutile pour TikTools, on nettoie.
+            existing.tiktok_username = None
+            update_fields.append('tiktok_username')
         if display_name and existing.nom != display_name:
             existing.nom = display_name
             update_fields.append('nom')
@@ -194,7 +199,7 @@ def get_or_create_vendeur_from_tiktok(profile: dict[str, Any], token_payload: di
         nom=display_name,
         contact='',
         tiktok_open_id=open_id,
-        tiktok_username=tiktok_username or None,
+        tiktok_username=tiktok_username if (tiktok_username and _is_valid_handle(tiktok_username)) else None,
         tiktok_access_token=access_token,
         tiktok_refresh_token=refresh_token,
     )

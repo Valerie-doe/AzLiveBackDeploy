@@ -1164,6 +1164,12 @@ def ensure_tiktok_scouts(*, vendeur_id: int | None = None) -> int:
     Ne cible que les vendeurs avec `tiktok_open_id` (OAuth) + unique_id valide.
     """
     if not tiktool_configured():
+        msg = (
+            'TikTools: TIKTOOL_API_KEY manquant — détection live désactivée '
+            '(connexion OAuth seule ne suffit pas).'
+        )
+        logger.warning(msg)
+        print(f'\n[TIKTOOL] {msg}\n', flush=True)
         return 0
     if _tiktool_ws_is_rate_limited():
         logger.warning(
@@ -1172,7 +1178,31 @@ def ensure_tiktok_scouts(*, vendeur_id: int | None = None) -> int:
         )
         return 0
     started = 0
-    for vendeur, unique_id in iter_connected_tiktok_vendeurs(vendeur_id=vendeur_id):
+    connected = list(iter_connected_tiktok_vendeurs(vendeur_id=vendeur_id))
+    if not connected:
+        # Explique pourquoi la détection « ne marche pas » alors que OAuth OK.
+        qs = Vendeur.objects.exclude(tiktok_open_id__isnull=True).exclude(tiktok_open_id='')
+        if vendeur_id is not None:
+            qs = qs.filter(pk=vendeur_id)
+        details = []
+        for v in qs[:10]:
+            raw = v.tiktok_username or ''
+            norm = normalize_tiktok_username(raw)
+            if not raw:
+                reason = 'tiktok_username vide'
+            elif not _is_valid_unique_id(norm):
+                reason = f'handle invalide {raw!r} (attendu ex. azplus.mg)'
+            else:
+                reason = 'ok mais non résolu'
+            details.append(f'#{v.pk}:{reason}')
+        msg = (
+            'TikTools: 0 scout — aucun compte OAuth avec @ valide. '
+            + ('; '.join(details) if details else 'Aucun vendeur avec tiktok_open_id.')
+        )
+        logger.warning(msg)
+        print(f'\n[TIKTOOL] {msg}\n', flush=True)
+        return 0
+    for vendeur, unique_id in connected:
         with _listeners_lock:
             existing = _scouts.get(unique_id)
             if existing and existing.is_alive():
@@ -1183,6 +1213,10 @@ def ensure_tiktok_scouts(*, vendeur_id: int | None = None) -> int:
                 'TikTools scout démarré pour @%s (vendeur #%s, compte connecté)',
                 unique_id,
                 vendeur.pk,
+            )
+            print(
+                f'\n[TIKTOOL] Scout démarré pour @{unique_id} (vendeur #{vendeur.pk})\n',
+                flush=True,
             )
     return started
 

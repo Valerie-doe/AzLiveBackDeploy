@@ -965,7 +965,32 @@ class SocialConnectAPIView(APIView):
                         defaults={'nom': p['nom'], 'statut': PageFacebook.STATUT_PRET}
                     )
         elif platform == 'tiktok':
-            vendeur.tiktok_username = request.data.get('tiktok_username', '@maboutique_tiktok')
+            from .jp_capture import normalize_tiktok_username
+
+            raw = (request.data.get('tiktok_username') or '').strip()
+            if not raw:
+                return Response(
+                    {
+                        'detail': (
+                            'Indiquez votre @TikTok (unique_id, ex. azplus.mg). '
+                            'Le nom d\'affichage (emoji) ne permet pas de détecter un live.'
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            handle = normalize_tiktok_username(raw)
+            if not re.fullmatch(r'[a-z0-9._-]+', handle):
+                return Response(
+                    {
+                        'detail': (
+                            f'@{handle} n\'est pas un @TikTok valide. '
+                            'Utilisez le handle de votre profil (lettres, chiffres, . _ -), '
+                            'pas le nom d\'affichage.'
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            vendeur.tiktok_username = f'@{handle}'
             vendeur.is_demo_mode = False
         elif platform == 'demo':
             vendeur.is_demo_mode = True
@@ -976,10 +1001,14 @@ class SocialConnectAPIView(APIView):
             return Response({'detail': 'Plateforme invalide.'}, status=status.HTTP_400_BAD_REQUEST)
 
         vendeur.save()
+        if platform == 'tiktok':
+            try:
+                from .tiktool_live import ensure_tiktok_scouts
+
+                ensure_tiktok_scouts(vendeur_id=vendeur.pk)
+            except Exception:
+                pass
         return Response(VendeurSerializer(vendeur).data, status=status.HTTP_200_OK)
-
-
-class SocialDisconnectAPIView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
