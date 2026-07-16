@@ -29,6 +29,18 @@ def thanks() -> str:
     return pick(['Misaotra', 'Misaotra betsaka', 'Misaotra indrindra', 'Misaotra tompoko'])
 
 
+def thanks_with_name(nom: str | None = None) -> str:
+    """Remerciement naturel, sans doubler « tompoko » / « betsaka » devant un prénom."""
+    prenom = first_name(nom)
+    if prenom and len(prenom) > 2:
+        return pick([
+            f'Misaotra betsaka {prenom}',
+            f'Misaotra indrindra {prenom}',
+            f'Misaotra {prenom}',
+        ])
+    return pick(['Misaotra betsaka', 'Misaotra indrindra', 'Misaotra tompoko'])
+
+
 def emoji(prob: float = 0.5, choices: list[str] | None = None) -> str:
     choices = choices or ['😊', '🙏', '❤️', '🥰']
     if random.random() < prob:

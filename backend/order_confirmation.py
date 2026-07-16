@@ -95,9 +95,8 @@ PERIOD_PATTERN = re.compile(
     r'\b(' + '|'.join(sorted(PERIOD_DEFAULT_TIMES.keys(), key=len, reverse=True)) + r')\b',
     re.IGNORECASE,
 )
-# « 2 atoandro », « 2h maraina », « amin'ny 14h »
 RELATIVE_HOUR_PERIOD_PATTERN = re.compile(
-    r"(?:amin'?ny|ami'?ny|a|à)?\s*(\d{1,2})\s*[hH]?\s*"
+    r"(?:@|amin'?ny|ami'?ny|a|à)?\s*(\d{1,2})\s*h?\s*"
     r'(matin|maraina|atoandro|aprem|apres[\s\-]?midi|soir|hariva)\b',
     re.IGNORECASE,
 )
@@ -105,16 +104,38 @@ CONNECTOR_PATTERN = re.compile(
     r"\b(?:amin'?ny|ami'?ny|ny|le|la|ce|cette|a|à)\b",
     re.IGNORECASE,
 )
+_GREETING_WORDS = (
+    r'bonjour|salama(?:\s+e)?|manahoana|mana[o]?[\s\-]?ahoana|miarahaba(?:\s+anao)?|'
+    r'bonsoir|coucou|hello|hi'
+)
+_GREETING_PARTICLES = r'e|ô|o|anao'
 GREETING_PREFIX = re.compile(
-    r'^(?:bonjour|salama|mana[o]? ahoana|bonsoir|coucou|hello|hi|coucou)\b[,\s!?.]*',
+    rf'^(?:(?:{_GREETING_WORDS}|{_GREETING_PARTICLES})\b[,\s!?.]*)+',
+    re.IGNORECASE,
+)
+GREETING_TOKEN = re.compile(
+    rf'^(?:{_GREETING_WORDS}|{_GREETING_PARTICLES})$',
+    re.IGNORECASE,
+)
+CONFIRMATION_TYPO_FIXES = (
+    (re.compile(r'\btatala\b', re.IGNORECASE), 'talata'),
+    (re.compile(r'\btalta\b', re.IGNORECASE), 'talata'),
+    (re.compile(r'\bmarina\b', re.IGNORECASE), 'maraina'),
+    (re.compile(r'\blatsinainy\b', re.IGNORECASE), 'alatsinainy'),
+    (re.compile(r'\blatsiny\b', re.IGNORECASE), 'alatsinainy'),
+    (re.compile(r'\bsab\b', re.IGNORECASE), 'sabotsy'),
+    (re.compile(r'\bzom\b', re.IGNORECASE), 'zoma'),
+    (re.compile(r'\barobia\b', re.IGNORECASE), 'alarobia'),
+    (re.compile(r'\bakamisy\b', re.IGNORECASE), 'alakamisy'),
+    (re.compile(r'\balahad\b', re.IGNORECASE), 'alahady'),
+)
+_AT_HOUR_PATTERN = re.compile(r'@\s*(\d{1,2})\s*h?\b', re.IGNORECASE)
+AM_HOUR_PATTERN = re.compile(
+    r"(?:@|amin'?ny|ami'?ny|am)\s*(\d{1,2})\s*h?\b",
     re.IGNORECASE,
 )
 DELIVERY_PREFIX = re.compile(
     r'^(?:aterina|livraison|delivery|ao|à|a)\s+',
-    re.IGNORECASE,
-)
-AM_HOUR_PATTERN = re.compile(
-    r"(?:amin'?ny|ami'?ny|am)\s*(\d{1,2})\b",
     re.IGNORECASE,
 )
 ISA_QUANTITY_PATTERN = re.compile(r'\bisa\s*[:=]\s*(\d{1,3})\b', re.IGNORECASE)
@@ -407,7 +428,7 @@ def _extract_time_token(text: str) -> tuple[str | None, str]:
         return None, work
 
     period_hour = re.search(
-        r'\b(matin|maraina|atoandro|aprem|apres[\s\-]?midi|soir|hariva)\s+(?:am\s+)?(\d{1,2})\b',
+        r'\b(matin|maraina|atoandro|aprem|apres[\s\-]?midi|soir|hariva)\s+(?:am\s+)?(\d{1,2})\s*h?\b',
         work,
         re.IGNORECASE,
     )
@@ -438,7 +459,11 @@ def _extract_time_token(text: str) -> tuple[str | None, str]:
         else:
             period = 'atoandro'
         token = f'{period} am {hour}'
-        work = (work[:am_match.start()] + ' ' + work[am_match.end():]).strip()
+        end = am_match.end()
+        ora_tail = re.match(r'\s*ora\b', work[end:], re.IGNORECASE)
+        if ora_tail:
+            end += ora_tail.end()
+        work = (work[:am_match.start()] + ' ' + work[end:]).strip()
         return token, work
 
     _, period_time = _extract_inline_date_time(work)
@@ -488,9 +513,172 @@ def _scrub_extracted_text(text: str, *tokens: str | None) -> str:
     scrub = AM_HOUR_PATTERN.sub(' ', scrub)
     scrub = re.sub(r'\b\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}\b', ' ', scrub)
     scrub = DELIVERY_PREFIX.sub('', scrub)
-    scrub = re.sub(r'\b(?:livraison|delivery|aterina|ao|isa|qty|qte|am)\b', ' ', scrub, flags=re.I)
+    scrub = re.sub(r'\b(?:livraison|delivery|aterina|ao|isa|qty|qte|am|@)\b', ' ', scrub, flags=re.I)
     scrub = CONNECTOR_PATTERN.sub(' ', scrub)
     return re.sub(r'[\s,;/\-–—]+', ' ', scrub).strip()
+
+
+def _is_greeting_token(text: str) -> bool:
+    cleaned = (text or '').strip(' ,;!?.')
+    return bool(cleaned and GREETING_TOKEN.match(cleaned))
+
+
+def _normalize_confirmation_input(text: str) -> str:
+    """Corrige abréviations et fautes fréquentes avant extraction."""
+    work = (text or '').strip()
+    work = re.sub(r'[?!]+$', '', work).strip()
+    work = _AT_HOUR_PATTERN.sub(r'am \1', work)
+    work = re.sub(r'@(?=\d)', 'am ', work)
+    for pattern, replacement in CONFIRMATION_TYPO_FIXES:
+        work = pattern.sub(replacement, work)
+    return work.strip()
+
+
+def _strip_greeting_prefix(text: str) -> str:
+    return GREETING_PREFIX.sub('', (text or '').strip()).strip(' ,;')
+
+
+def _canonicalize_confirmation_text(text: str) -> str:
+    work = _normalize_confirmation_input(text)
+    work = _strip_greeting_prefix(work)
+    work = _strip_quantity_from_text(work)
+    return work.strip()
+
+
+def _is_plausible_nom(value: str | None) -> bool:
+    cleaned = (value or '').strip(' ,;!?.@')
+    if not cleaned or _is_greeting_token(cleaned):
+        return False
+    if cleaned.startswith('@') or not re.search(r'[a-zA-Zàâäéèêëïîôùûüç]', cleaned):
+        return False
+    if len(cleaned) <= 2 and cleaned.isalpha():
+        return False
+    if _looks_like_date(cleaned) or _looks_like_time(cleaned) or _looks_like_phone(cleaned):
+        return False
+    return True
+
+
+def _sanitize_parsed_fields(fields: dict[str, str]) -> dict[str, str]:
+    cleaned = dict(fields)
+    if cleaned.get('nom') and not _is_plausible_nom(cleaned['nom']):
+        cleaned.pop('nom', None)
+    return cleaned
+
+
+def _parse_freeform_spaced_confirmation(text: str) -> dict[str, str]:
+    cleaned = _canonicalize_confirmation_text(text)
+    if not cleaned or '\n' in cleaned or ',' in cleaned or ';' in cleaned:
+        return {}
+
+    phone_match = PHONE_LOOSE_PATTERN.search(cleaned)
+    if not phone_match:
+        return {}
+
+    phone = _normalize_phone(phone_match.group(0))
+    if not phone:
+        return {}
+
+    before = cleaned[:phone_match.start()].strip()
+    after = cleaned[phone_match.end():].strip()
+    if not before:
+        return {}
+    after = re.sub(
+        r'^(?:aterina|livraison|delivery)\s+(?:am|amin\'?ny)?\s*',
+        '',
+        after,
+        flags=re.IGNORECASE,
+    ).strip()
+    after = DELIVERY_PREFIX.sub('', after).strip()
+
+    fields: dict[str, str] = {'telephone': phone}
+    if before:
+        words = [word for word in before.split() if word]
+        if len(words) >= 2:
+            fields['nom'] = words[0]
+            fields['adresse'] = _normalize_address_segment(' '.join(words[1:]))
+        elif len(words) == 1 and _is_plausible_nom(words[0]):
+            fields['nom'] = words[0]
+
+    if after:
+        time_token, work = _extract_time_token(after)
+        if time_token:
+            fields['heure_livraison'] = time_token
+        date_token, work = _extract_date_token(work or after)
+        if date_token:
+            fields['date_livraison'] = date_token
+        elif not time_token:
+            period_match = PERIOD_PATTERN.search(_normalize_text(after))
+            if period_match:
+                fields['heure_livraison'] = period_match.group(1)
+        if not fields.get('adresse'):
+            addr = _normalize_address_segment(_scrub_extracted_text(work))
+            if addr:
+                fields['adresse'] = addr
+
+    return _sanitize_parsed_fields(fields)
+
+
+def _parse_structured_comma_confirmation(text: str) -> dict[str, str]:
+    """Format courant : [salut], nom, tél, adresse[, date/heure][, isa]."""
+    cleaned = (text or '').strip()
+    if '\n' in cleaned:
+        return {}
+
+    parts = [part.strip() for part in re.split(r'[,;]', cleaned) if part.strip()]
+    parts = [part for part in parts if not _is_greeting_token(part)]
+    if parts and _is_quantity_line(parts[-1]):
+        parts = parts[:-1]
+    if len(parts) < 3:
+        return {}
+
+    phone_idx = next((i for i, part in enumerate(parts) if _looks_like_phone(part)), None)
+    if phone_idx is None or phone_idx < 1:
+        return {}
+
+    name = parts[phone_idx - 1]
+    if _is_greeting_token(name) or _looks_like_phone(name):
+        return {}
+
+    phone = _normalize_phone(parts[phone_idx])
+    if not phone:
+        return {}
+
+    fields: dict[str, str] = {'nom': name, 'telephone': phone}
+    tail = parts[phone_idx + 1:]
+    if not tail:
+        return fields
+
+    if len(tail) == 1:
+        segment = DELIVERY_PREFIX.sub('', tail[0]).strip()
+        time_token, work = _extract_time_token(segment)
+        if time_token:
+            fields['heure_livraison'] = time_token
+        date_token, work = _extract_date_token(work)
+        if date_token:
+            fields['date_livraison'] = date_token
+        addr = _normalize_address_segment(_scrub_extracted_text(work))
+        if addr:
+            fields['adresse'] = addr
+        return fields
+
+    addr = _normalize_address_segment(DELIVERY_PREFIX.sub('', tail[0]).strip())
+    if addr:
+        fields['adresse'] = addr
+    datetime_blob = ' '.join(tail[1:])
+    inline_date, inline_time = _extract_inline_date_time(datetime_blob)
+    if inline_date:
+        fields['date_livraison'] = inline_date
+    if inline_time:
+        fields['heure_livraison'] = inline_time
+    if not inline_date:
+        date_token, _ = _extract_date_token(datetime_blob)
+        if date_token:
+            fields['date_livraison'] = date_token
+    if not inline_time:
+        time_token, _ = _extract_time_token(datetime_blob)
+        if time_token:
+            fields['heure_livraison'] = time_token
+    return fields
 
 
 def _extract_fields_from_fragment(text: str) -> dict[str, str]:
@@ -500,7 +688,7 @@ def _extract_fields_from_fragment(text: str) -> dict[str, str]:
     if not work:
         return fields
 
-    work = GREETING_PREFIX.sub('', work).strip(' ,;')
+    work = _strip_greeting_prefix(work)
     work = _strip_quantity_from_text(work)
 
     phone_match = PHONE_LOOSE_PATTERN.search(work)
@@ -524,14 +712,15 @@ def _extract_fields_from_fragment(text: str) -> dict[str, str]:
         if len(words) == 1:
             if fields.get('telephone') and not fields.get('adresse'):
                 fields['adresse'] = _normalize_address_segment(words[0])
-            elif not fields.get('nom'):
+            elif not fields.get('nom') and _is_plausible_nom(words[0]):
                 fields['nom'] = words[0]
             elif not fields.get('adresse'):
                 fields['adresse'] = _normalize_address_segment(words[0])
         else:
-            fields.setdefault('nom', words[0])
+            if not fields.get('nom') and _is_plausible_nom(words[0]):
+                fields.setdefault('nom', words[0])
             fields.setdefault('adresse', _normalize_address_segment(' '.join(words[1:])))
-    return fields
+    return _sanitize_parsed_fields(fields)
 
 
 def _parse_phone_adresse_datetime_commas(text: str) -> dict[str, str]:
@@ -577,7 +766,7 @@ def _expand_confirmation_segment(segment: str) -> list[str]:
     if not remaining:
         return expanded
 
-    remaining = GREETING_PREFIX.sub('', remaining).strip() or remaining
+    remaining = _strip_greeting_prefix(remaining) or remaining
 
     phone_match = PHONE_LOOSE_PATTERN.search(remaining)
     if phone_match:
@@ -612,7 +801,7 @@ def _prepare_confirmation_lines(text: str) -> list[str]:
     for line in _split_confirmation_lines(text):
         for part in _expand_confirmation_segment(line):
             part = part.strip()
-            if not part or GREETING_PREFIX.match(part):
+            if not part or _is_greeting_token(part):
                 continue
             lines.append(part)
     return lines
@@ -627,7 +816,7 @@ def parse_confirmation_text(text: str) -> dict[str, str]:
       12 mai
       14h
     """
-    cleaned = (text or '').strip()
+    cleaned = _normalize_confirmation_input((text or '').strip())
     if not cleaned:
         return {}
 
@@ -642,12 +831,20 @@ def parse_confirmation_text(text: str) -> dict[str, str]:
 
     # Téléphone, adresse, date/heure sur une ligne séparés par des virgules.
     if '\n' not in cleaned:
+        structured = _parse_structured_comma_confirmation(cleaned)
+        if structured.get('nom') and structured.get('telephone'):
+            return structured
+
         comma_fields = _parse_phone_adresse_datetime_commas(cleaned)
         if comma_fields.get('telephone') and comma_fields.get('adresse'):
             return comma_fields
 
     # Message sur une seule ligne : formats très variables (virgules, espaces, mélangés).
     if '\n' not in cleaned:
+        spaced = _parse_freeform_spaced_confirmation(cleaned)
+        if spaced.get('telephone') and (spaced.get('nom') or spaced.get('adresse')):
+            return spaced
+
         freeform = _extract_fields_from_fragment(cleaned)
         if freeform.get('telephone') or (
             freeform.get('nom') and (freeform.get('adresse') or freeform.get('date_livraison'))
@@ -693,9 +890,13 @@ def parse_confirmation_text(text: str) -> dict[str, str]:
 
     others = classified['others']
     if others:
-        parsed.setdefault('nom', others[0])
+        first_other = next((item for item in others if _is_plausible_nom(item)), None)
+        if first_other:
+            parsed.setdefault('nom', first_other)
         if len(others) > 1:
-            parsed.setdefault('adresse', _normalize_address_segment(' '.join(others[1:])))
+            rest = [item for item in others if item != parsed.get('nom')]
+            if rest:
+                parsed.setdefault('adresse', _normalize_address_segment(' '.join(rest)))
         elif len(others) == 1 and not parsed.get('adresse'):
             # Une seule ligne texte restante sans téléphone/date → probablement l'adresse/quartier
             if parsed.get('nom') and parsed.get('telephone') and parsed.get('date_livraison'):
@@ -742,7 +943,7 @@ def parse_confirmation_text(text: str) -> dict[str, str]:
     if sum(1 for key in ('nom', 'telephone', 'adresse', 'date_livraison') if parsed.get(key)) < 3:
         parsed = _merge_parsed_fields(parsed, _extract_fields_from_fragment(cleaned))
 
-    return parsed
+    return _sanitize_parsed_fields(parsed)
 
 
 def _parse_delivery_date(value: str | None):
