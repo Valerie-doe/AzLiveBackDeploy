@@ -136,6 +136,25 @@ class ProduitSerializer(serializers.ModelSerializer):
         model = Produit
         fields = ['id', 'nom', 'photo', 'photo_url', 'images', 'vendeur', 'vendeur_id', 'variantes']
 
+
+class ProduitCompactSerializer(serializers.ModelSerializer):
+    variantes = VarianteNestedSerializer(many=True, required=False)
+    photo = serializers.SerializerMethodField()
+    photo_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Produit
+        fields = ['id', 'nom', 'photo', 'photo_url', 'variantes']
+
+    def _get_primary_image(self, obj):
+        return obj.photo
+
+    def get_photo(self, obj):
+        return build_image_absolute_url(self._get_primary_image(obj), self.context.get('request'))
+
+    def get_photo_url(self, obj):
+        return self.get_photo(obj)
+
     def _get_primary_image(self, obj):
         first_image = obj.images.order_by('created_at', 'id').first()
         if first_image:
@@ -292,11 +311,17 @@ class LiveCodeJPSerializer(serializers.ModelSerializer):
         fields = ['id', 'variante', 'produit_id', 'code']
 
 
+class LiveSummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Live
+        fields = ['id', 'titre', 'statut']
+
+
 class LiveSerializer(serializers.ModelSerializer):
     chiffre_affaires = serializers.SerializerMethodField()
     nb_fiches = serializers.SerializerMethodField()
     operateur_nom = serializers.SerializerMethodField()
-    produits_dressing = ProduitSerializer(many=True, read_only=True)
+    produits_dressing = ProduitCompactSerializer(many=True, read_only=True)
     produits_dressing_ids = serializers.PrimaryKeyRelatedField(
         queryset=Produit.objects.all(), source='produits_dressing', many=True, write_only=True, required=False
     )
@@ -402,11 +427,11 @@ class LivraisonSerializer(serializers.ModelSerializer):
 class CommandeSerializer(serializers.ModelSerializer):
     client = ClientSerializer(read_only=True)
     client_id = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all(), source='client', write_only=True)
-    produit = ProduitSerializer(read_only=True)
+    produit = ProduitCompactSerializer(read_only=True)
     produit_id = serializers.PrimaryKeyRelatedField(queryset=Produit.objects.all(), source='produit', write_only=True)
     paiement = PaiementSerializer(read_only=True)
     livraison = LivraisonSerializer(read_only=True)
-    live = LiveSerializer(read_only=True)
+    live = LiveSummarySerializer(read_only=True)
     live_id = serializers.PrimaryKeyRelatedField(queryset=Live.objects.all(), source='live', write_only=True, allow_null=True, required=False)
     variante = VarianteSerializer(read_only=True)
     variante_id = serializers.PrimaryKeyRelatedField(queryset=Variante.objects.all(), source='variante', write_only=True, allow_null=True, required=False)

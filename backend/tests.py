@@ -95,6 +95,28 @@ class BackendAPITest(TestCase):
         self.assertEqual(results[0]['nom'], 'Robe Rouge')
         self.assertEqual(len(results[0]['variantes']), 1)
 
+    def test_commande_list_endpoint_returns_lightweight_nested_payload(self):
+        live = Live.objects.create(titre='Live test', vendeur=self.vendeur, statut=Live.STATUT_EN_COURS)
+        client = Client.objects.create(nom='Lova', telephone='0341234567', adresse='Tana')
+        commande = Commande.objects.create(
+            client=client,
+            produit=self.produit,
+            variante=self.variante,
+            live=live,
+            ordre_jp=1,
+        )
+
+        response = self.client.get(f'/api/commandes/?live_id={live.id}')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        results = data['results']
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['id'], commande.id)
+        self.assertNotIn('vendeur', results[0]['produit'])
+        self.assertNotIn('images', results[0]['produit'])
+        self.assertEqual(results[0]['live']['id'], live.id)
+        self.assertEqual(results[0]['live']['titre'], 'Live test')
+
     def test_commande_search_endpoint(self):
         client = Client.objects.create(nom='Serge', telephone='0344455667', adresse='Tananarive')
         commande = Commande.objects.create(client=client, produit=self.produit, variante=self.variante, ordre_jp=1)
