@@ -147,18 +147,11 @@ class ProduitCompactSerializer(serializers.ModelSerializer):
         fields = ['id', 'nom', 'photo', 'photo_url', 'variantes']
 
     def _get_primary_image(self, obj):
-        return obj.photo
-
-    def get_photo(self, obj):
-        return build_image_absolute_url(self._get_primary_image(obj), self.context.get('request'))
-
-    def get_photo_url(self, obj):
-        return self.get_photo(obj)
-
-    def _get_primary_image(self, obj):
-        first_image = obj.images.order_by('created_at', 'id').first()
-        if first_image:
-            return first_image.image
+        # Utilise le cache prefetch_related('images') plutôt que .order_by().first(),
+        # qui déclenchait une requête SQL par produit (N+1 sur chaque liste de lives).
+        images = sorted(obj.images.all(), key=lambda img: (img.created_at, img.id))
+        if images:
+            return images[0].image
         return obj.photo
 
     def get_photo(self, obj):
@@ -337,18 +330,20 @@ class LiveSerializer(serializers.ModelSerializer):
         ]
 
     def get_chiffre_affaires(self, obj):
-        confirmed_status = [
+        confirmed_status = {
             Commande.STATUT_CONFIRME,
             Commande.STATUT_PREPARE,
             Commande.STATUT_EN_LIVRAISON,
             Commande.STATUT_LIVRE,
-        ]
-        orders = obj.commandes.filter(statut__in=confirmed_status)
+        }
+        # Utilise le cache prefetch_related('commandes') du queryset (get_queryset) :
+        # un .filter()/.count() sur la relation refait sinon une requête SQL par live.
+        orders = [c for c in obj.commandes.all() if c.statut in confirmed_status]
         total = sum(_commande_prix(order) for order in orders)
         return float(total)
 
     def get_nb_fiches(self, obj):
-        return obj.commandes.count()
+        return len(obj.commandes.all())
 
     def get_operateur_nom(self, obj):
         return obj.operateur.nom if obj.operateur else None

@@ -289,8 +289,11 @@ class Commande(models.Model):
     def get_prix_unitaire(self):
         if self.variante_id:
             return self.variante.prix_unitaire
-        first = self.produit.variantes.order_by('id').first()
-        return first.prix_unitaire if first else 0
+        # .all() (plutôt que .order_by().first()) permet de réutiliser le cache
+        # prefetch_related('produit__variantes') quand il existe, évitant une
+        # requête SQL supplémentaire par commande sur les vues liste.
+        variantes = sorted(self.produit.variantes.all(), key=lambda v: v.id)
+        return variantes[0].prix_unitaire if variantes else 0
 
     def get_prix_total(self):
         return self.get_prix_unitaire() * self.quantite_effective

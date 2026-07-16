@@ -101,11 +101,18 @@ class CommandeListCreateView(generics.ListCreateAPIView):
     serializer_class = CommandeSerializer
 
     def get_queryset(self):
+        # select_related/prefetch_related : évite les requêtes N+1 lors de la sérialisation
+        # imbriquée (client, produit + variantes/images, live + dressing), notamment pour la
+        # vue Clients qui agrège toutes les commandes d'un vendeur (?vendeur_id=).
         queryset = (
             Commande.objects
-            .select_related('client', 'variante', 'paiement', 'livraison', 'live')
-            .select_related('produit')
-            .prefetch_related('produit__variantes')
+            .select_related('client', 'produit', 'variante', 'paiement', 'livraison', 'live')
+            .prefetch_related(
+                'produit__variantes',
+                'produit__images',
+                'live__produits_dressing__variantes',
+                'live__produits_dressing__images',
+            )
             .all()
         )
         live_id = self.request.query_params.get('live_id')
@@ -600,7 +607,11 @@ class CommandeLancerLivraisonAPIView(APIView):
 class DashboardStatsAPIView(APIView):
     def get(self, request):
         vendeur_id = request.query_params.get('vendeur_id')
-        commandes_query = Commande.objects.select_related('produit', 'variante').all()
+        commandes_query = (
+            Commande.objects.select_related('produit', 'variante')
+            .prefetch_related('produit__variantes')
+            .all()
+        )
         lives_query = Live.objects.all()
         products_query = Produit.objects.prefetch_related('variantes').all()
 
@@ -635,11 +646,14 @@ class DashboardStatsAPIView(APIView):
                 Commande.STATUT_LIVRE
             ]
         )
-        confirmed_count = confirmed_orders.count()
+        # Une seule matérialisation de la queryset (au lieu de .count() + itération +
+        # 12 requêtes filtrées par mois) : évite 13+ requêtes SQL redondantes.
+        confirmed_orders_list = list(confirmed_orders)
+        confirmed_count = len(confirmed_orders_list)
 
         taux_confirmation = (confirmed_count / total_jps * 100) if total_jps > 0 else 0
 
-        chiffre_affaires = sum(float(cmd.get_prix_total()) for cmd in confirmed_orders)
+        chiffre_affaires = sum(float(cmd.get_prix_total()) for cmd in confirmed_orders_list)
 
         commission_rate = float(ParametresPlateforme.get_current().taux_commission)
         montant_a_reverser = float(chiffre_affaires) * (1.0 - commission_rate)
@@ -658,14 +672,13 @@ class DashboardStatsAPIView(APIView):
             1: 'Janvier', 2: 'Février', 3: 'Mars', 4: 'Avril', 5: 'Mai', 6: 'Juin',
             7: 'Juillet', 8: 'Août', 9: 'Septembre', 10: 'Octobre', 11: 'Novembre', 12: 'Décembre'
         }
-        monthly_chart_data = []
-        for m_num, m_name in months.items():
-            month_orders = confirmed_orders.filter(date_creation__month=m_num)
-            revenue = sum(float(cmd.get_prix_total()) for cmd in month_orders)
-            monthly_chart_data.append({
-                'mois': m_name,
-                'chiffre_affaires': float(revenue)
-            })
+        monthly_totals = {m_num: 0.0 for m_num in months}
+        for cmd in confirmed_orders_list:
+            monthly_totals[cmd.date_creation.month] += float(cmd.get_prix_total())
+        monthly_chart_data = [
+            {'mois': m_name, 'chiffre_affaires': monthly_totals[m_num]}
+            for m_num, m_name in months.items()
+        ]
 
         best_sellers_ranking = []
         best_sellers_query = (
@@ -712,7 +725,31 @@ class LiveListCreateView(generics.ListCreateAPIView):
     permission_classes = [AllowAny]
 
     def get_queryset(self):
-        queryset = Live.objects.select_related('vendeur').all().order_by('-date_live')
+        # Prefetch complet : évite le N+1 (une vue liste sans ça pouvait générer
+        # plusieurs centaines de requêtes SQL -> ~40s de chargement en prod).
+        # Les méthodes du LiveSerializer (chiffre_affaires/nb_fiches) et
+        # ProduitCompactSerializer lisent ces caches au lieu de re-requêter.
+        queryset = (
+            Live.objects.select_related('vendeur', 'operateur')
+            .prefetch_related(
+                models.Prefetch(
+                    'commandes',
+                    queryset=Commande.objects.select_related('variante', 'produit').prefetch_related(
+                        'produit__variantes'
+                    ),
+                ),
+                models.Prefetch(
+                    'produits_dressing',
+                    queryset=Produit.objects.prefetch_related('variantes', 'images'),
+                ),
+                models.Prefetch(
+                    'codes_jp',
+                    queryset=LiveCodeJP.objects.select_related('variante'),
+                ),
+            )
+            .all()
+            .order_by('-date_live')
+        )
         vendeur_id = self.request.query_params.get('vendeur_id')
         if vendeur_id:
             queryset = queryset.filter(vendeur_id=vendeur_id)
@@ -735,8 +772,27 @@ class LiveListCreateView(generics.ListCreateAPIView):
 
 
 class LiveDetailView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = Live.objects.all()
     serializer_class = LiveSerializer
+
+    def get_queryset(self):
+        # Même prefetch que la liste : la réponse (ex. ajout d'article au dressing
+        # pendant un live) sérialise les mêmes champs imbriqués.
+        return Live.objects.select_related('vendeur', 'operateur').prefetch_related(
+            models.Prefetch(
+                'commandes',
+                queryset=Commande.objects.select_related('variante', 'produit').prefetch_related(
+                    'produit__variantes'
+                ),
+            ),
+            models.Prefetch(
+                'produits_dressing',
+                queryset=Produit.objects.prefetch_related('variantes', 'images'),
+            ),
+            models.Prefetch(
+                'codes_jp',
+                queryset=LiveCodeJP.objects.select_related('variante'),
+            ),
+        )
     permission_classes = [AllowAny]
 
     def perform_update(self, serializer):

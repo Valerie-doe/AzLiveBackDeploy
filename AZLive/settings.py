@@ -118,6 +118,11 @@ else:
             'PASSWORD': os.environ.get('POSTGRES_PASSWORD', ''),
             'HOST': os.environ.get('POSTGRES_HOST', 'localhost'),
             'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+            # Réutilise la connexion PostgreSQL entre requêtes (au lieu d'en ouvrir
+            # une nouvelle à chaque appel) : gain notable de latence en prod, surtout
+            # avec le polling fréquent (lives/commandes) du frontend.
+            'CONN_MAX_AGE': int(os.environ.get('POSTGRES_CONN_MAX_AGE', '60')),
+            'CONN_HEALTH_CHECKS': True,
         }
     }
 
