@@ -1,8 +1,10 @@
 import re
 from datetime import timedelta
 
+import threading
+
 from django.db import models, transaction
-from django.db.models import Max, Sum, Count, Value
+from django.db.models import Max, Sum, Count, Value, F, Q, DecimalField, ExpressionWrapper
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -720,80 +722,78 @@ class DashboardStatsAPIView(APIView):
         }, status=status.HTTP_200_OK)
 
 
+def _live_list_queryset():
+    """Queryset lives optimisé : stats en SQL, dressing = IDs seulement."""
+    confirmed = [
+        Commande.STATUT_CONFIRME,
+        Commande.STATUT_PREPARE,
+        Commande.STATUT_EN_LIVRAISON,
+        Commande.STATUT_LIVRE,
+    ]
+    money = DecimalField(max_digits=14, decimal_places=2)
+    line_total = ExpressionWrapper(
+        Coalesce(F('commandes__variante__prix_unitaire'), Value(0, output_field=money))
+        * Coalesce(F('commandes__quantite'), Value(1)),
+        output_field=money,
+    )
+    return (
+        Live.objects.select_related('vendeur', 'operateur')
+        .prefetch_related(
+            'produits_dressing',
+            models.Prefetch(
+                'codes_jp',
+                queryset=LiveCodeJP.objects.select_related('variante'),
+            ),
+        )
+        .annotate(
+            annotated_nb_fiches=Count('commandes', distinct=True),
+            annotated_ca=Coalesce(
+                Sum(line_total, filter=Q(commandes__statut__in=confirmed)),
+                Value(0, output_field=money),
+                output_field=money,
+            ),
+        )
+        .order_by('-date_live')
+    )
+
+
 class LiveListCreateView(generics.ListCreateAPIView):
     serializer_class = LiveSerializer
     permission_classes = [AllowAny]
 
     def get_queryset(self):
-        # Prefetch complet : évite le N+1 (une vue liste sans ça pouvait générer
-        # plusieurs centaines de requêtes SQL -> ~40s de chargement en prod).
-        # Les méthodes du LiveSerializer (chiffre_affaires/nb_fiches) et
-        # ProduitCompactSerializer lisent ces caches au lieu de re-requêter.
-        queryset = (
-            Live.objects.select_related('vendeur', 'operateur')
-            .prefetch_related(
-                models.Prefetch(
-                    'commandes',
-                    queryset=Commande.objects.select_related('variante', 'produit').prefetch_related(
-                        'produit__variantes'
-                    ),
-                ),
-                models.Prefetch(
-                    'produits_dressing',
-                    queryset=Produit.objects.prefetch_related('variantes', 'images'),
-                ),
-                models.Prefetch(
-                    'codes_jp',
-                    queryset=LiveCodeJP.objects.select_related('variante'),
-                ),
-            )
-            .all()
-            .order_by('-date_live')
-        )
+        queryset = _live_list_queryset()
         vendeur_id = self.request.query_params.get('vendeur_id')
         if vendeur_id:
             queryset = queryset.filter(vendeur_id=vendeur_id)
         return queryset
 
     def list(self, request, *args, **kwargs):
-        # ?sync=1 → démarre uniquement les scouts WebSocket (0 REST = 0 quota API).
+        # ?sync=1 → démarre les scouts WebSocket EN ARRIÈRE-PLAN (ne bloque plus le GET).
         if str(request.query_params.get('sync') or '') in {'1', 'true', 'yes'}:
             vendeur_id = request.query_params.get('vendeur_id')
-            try:
-                from .tiktool_live import ensure_tiktok_scouts
+            kwargs_scouts = {}
+            if vendeur_id and str(vendeur_id).isdigit():
+                kwargs_scouts['vendeur_id'] = int(vendeur_id)
 
-                kwargs_scouts = {}
-                if vendeur_id and str(vendeur_id).isdigit():
-                    kwargs_scouts['vendeur_id'] = int(vendeur_id)
-                ensure_tiktok_scouts(**kwargs_scouts)
-            except Exception:
-                pass
+            def _start_scouts():
+                try:
+                    from .tiktool_live import ensure_tiktok_scouts
+
+                    ensure_tiktok_scouts(**kwargs_scouts)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_start_scouts, name='tiktok-scouts-sync', daemon=True).start()
         return super().list(request, *args, **kwargs)
 
 
 class LiveDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = LiveSerializer
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
-        # Même prefetch que la liste : la réponse (ex. ajout d'article au dressing
-        # pendant un live) sérialise les mêmes champs imbriqués.
-        return Live.objects.select_related('vendeur', 'operateur').prefetch_related(
-            models.Prefetch(
-                'commandes',
-                queryset=Commande.objects.select_related('variante', 'produit').prefetch_related(
-                    'produit__variantes'
-                ),
-            ),
-            models.Prefetch(
-                'produits_dressing',
-                queryset=Produit.objects.prefetch_related('variantes', 'images'),
-            ),
-            models.Prefetch(
-                'codes_jp',
-                queryset=LiveCodeJP.objects.select_related('variante'),
-            ),
-        )
-    permission_classes = [AllowAny]
+        return _live_list_queryset()
 
     def perform_update(self, serializer):
         old_statut = serializer.instance.statut
@@ -804,6 +804,17 @@ class LiveDetailView(generics.RetrieveUpdateDestroyAPIView):
             elif live.statut == Live.STATUT_TERMINE:
                 live = arreter_live(live)
             serializer.instance = live
+
+    def update(self, request, *args, **kwargs):
+        # Recharge après save pour conserver annotations SQL (CA / nb_fiches)
+        # sans retomber sur des requêtes N+1 dans le serializer.
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        refreshed = self.get_queryset().get(pk=serializer.instance.pk)
+        return Response(self.get_serializer(refreshed).data)
 
 
 class LiveCodesAPIView(APIView):

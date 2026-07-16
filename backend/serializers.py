@@ -279,12 +279,20 @@ class ProduitCompactSerializer(serializers.ModelSerializer):
         return instance
 
 
+class VendeurLiteSerializer(serializers.ModelSerializer):
+    """Vendeur allégé pour les réponses produit (évite pages_facebook à chaque article)."""
+
+    class Meta:
+        model = Vendeur
+        fields = ['id', 'nom', 'facebook_page_name']
+
+
 class ProduitSerializer(ProduitCompactSerializer):
     """Version complète (CRUD) de ProduitCompactSerializer : ajoute vendeur/images et
     hérite de create()/update()/_sync_images()/_sync_variantes() pour la création et
     la modification de produits (dressing, page Produits)."""
 
-    vendeur = VendeurSerializer(read_only=True)
+    vendeur = VendeurLiteSerializer(read_only=True)
     vendeur_id = serializers.PrimaryKeyRelatedField(queryset=Vendeur.objects.all(), source='vendeur', write_only=True)
     images = ProduitImageSerializer(many=True, read_only=True)
 
@@ -315,7 +323,9 @@ class LiveSerializer(serializers.ModelSerializer):
     chiffre_affaires = serializers.SerializerMethodField()
     nb_fiches = serializers.SerializerMethodField()
     operateur_nom = serializers.SerializerMethodField()
-    produits_dressing = ProduitCompactSerializer(many=True, read_only=True)
+    # IDs seulement : le frontend charge déjà le catalogue produits à part.
+    # Évite de re-sérialiser variantes/images pour chaque live (liste + dressing).
+    produits_dressing = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
     produits_dressing_ids = serializers.PrimaryKeyRelatedField(
         queryset=Produit.objects.all(), source='produits_dressing', many=True, write_only=True, required=False
     )
@@ -331,20 +341,22 @@ class LiveSerializer(serializers.ModelSerializer):
         ]
 
     def get_chiffre_affaires(self, obj):
+        # Annoté en SQL dans get_queryset (liste/détail) — pas de boucle Python/N+1.
+        if hasattr(obj, 'annotated_ca'):
+            return float(obj.annotated_ca or 0)
         confirmed_status = {
             Commande.STATUT_CONFIRME,
             Commande.STATUT_PREPARE,
             Commande.STATUT_EN_LIVRAISON,
             Commande.STATUT_LIVRE,
         }
-        # Utilise le cache prefetch_related('commandes') du queryset (get_queryset) :
-        # un .filter()/.count() sur la relation refait sinon une requête SQL par live.
-        orders = [c for c in obj.commandes.all() if c.statut in confirmed_status]
-        total = sum(_commande_prix(order) for order in orders)
-        return float(total)
+        orders = obj.commandes.filter(statut__in=confirmed_status).select_related('variante', 'produit')
+        return float(sum(_commande_prix(order) for order in orders))
 
     def get_nb_fiches(self, obj):
-        return len(obj.commandes.all())
+        if hasattr(obj, 'annotated_nb_fiches'):
+            return int(obj.annotated_nb_fiches or 0)
+        return obj.commandes.count()
 
     def get_operateur_nom(self, obj):
         return obj.operateur.nom if obj.operateur else None
