@@ -9,6 +9,15 @@ from .models import Live
 from .serializers import LiveSerializer
 
 
+def _live_for_response(live: Live) -> Live:
+    """Recharge léger après démarrer/arrêter (IDs dressing, pas de N+1)."""
+    return (
+        Live.objects.select_related('vendeur', 'operateur')
+        .prefetch_related('produits_dressing', 'codes_jp')
+        .get(pk=live.pk)
+    )
+
+
 class LiveDemarrerAPIView(APIView):
     permission_classes = [AllowAny]
 
@@ -19,7 +28,7 @@ class LiveDemarrerAPIView(APIView):
             return Response(
                 {
                     'detail': 'Live démarré sur toutes les plateformes connectées.',
-                    'live': LiveSerializer(live).data,
+                    'live': LiveSerializer(_live_for_response(live)).data,
                 },
                 status=status.HTTP_200_OK,
             )
@@ -36,7 +45,7 @@ class LiveArreterAPIView(APIView):
         return Response(
             {
                 'detail': 'Live arrêté sur toutes les plateformes.',
-                'live': LiveSerializer(live).data,
+                'live': LiveSerializer(_live_for_response(live)).data,
             },
             status=status.HTTP_200_OK,
         )
