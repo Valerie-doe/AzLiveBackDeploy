@@ -88,17 +88,32 @@ def _tiktool_is_rate_limited() -> bool:
         return True
 
 
-def _mark_ws_rate_limited(seconds: float = 3600.0) -> None:
-    """Sandbox TikTools : 60 connexions WS / heure. Pause longue après 4429."""
+def _ws_cooldown_seconds(default: float = 3600.0) -> float:
+    """Durée de pause après un 4429 (configurable via TIKTOOL_WS_COOLDOWN_SECONDS)."""
+    try:
+        return max(float(getattr(settings, 'TIKTOOL_WS_COOLDOWN_SECONDS', default) or default), 300.0)
+    except (TypeError, ValueError):
+        return max(default, 300.0)
+
+
+def _mark_ws_rate_limited(seconds: float | None = None) -> None:
+    """Sandbox TikTools : quota WS (≈ 50–60 sessions / 24h ou /heure selon le plan).
+
+    Après un close 4429 on coupe les nouvelles connexions WS pour ne pas brûler
+    le quota en boucle. La détection continue via REST (voir recover_tiktool_listeners).
+    """
     global _ws_rate_limited_until
-    until = timezone.now() + timedelta(seconds=max(seconds, 300.0))
+    pause = _ws_cooldown_seconds() if seconds is None else max(float(seconds), 300.0)
+    until = timezone.now() + timedelta(seconds=pause)
     with _ws_rate_limit_lock:
         if _ws_rate_limited_until is None or until > _ws_rate_limited_until:
             _ws_rate_limited_until = until
             logger.warning(
-                'TikTools WebSocket quota (4429) : pause jusqu’à %s '
-                '(sandbox ≈ 60 connexions/heure — ne pas reconnecter en boucle)',
+                'TikTools WebSocket quota (4429) : pause WS jusqu’à %s (%.0fs). '
+                'Détection live basculée sur REST pendant ce temps '
+                '(évite de reconnecter en boucle — chaque reconnexion consomme 1 session).',
                 _ws_rate_limited_until.isoformat(),
+                pause,
             )
 
 
@@ -724,7 +739,8 @@ class _TikToolLiveListener(threading.Thread):
         self.unique_id = normalize_tiktok_username(unique_id)
         self.stop_event = stop_event
         self.scout = scout
-        self._reconnect_delay = 15.0
+        # Scout : départ plus lent pour économiser les sessions WS Sandbox.
+        self._reconnect_delay = 60.0 if scout else 15.0
         self._last_close_code: int | None = None
         self._session_saw_live = False
         self._stream_end_event_seen = False
@@ -764,20 +780,30 @@ class _TikToolLiveListener(threading.Thread):
 
             if self._last_close_code in _WS_STREAM_END_CODES or self._stream_end_event_seen:
                 # Fin explicite : retenter bientôt (relance TikTok fréquente).
-                delay = 8.0
-                self._reconnect_delay = 8.0
+                # Scout : délai min plus long pour ne pas brûler le quota sandbox.
+                delay = 45.0 if self.scout else 8.0
+                self._reconnect_delay = delay
             elif self._last_close_code == 4429 or _tiktool_ws_is_rate_limited():
-                delay = max(self._reconnect_delay, tiktool_ws_rate_limit_remaining_seconds(), 600.0)
+                delay = max(
+                    self._reconnect_delay,
+                    tiktool_ws_rate_limit_remaining_seconds(),
+                    _ws_cooldown_seconds(),
+                )
             else:
+                # Coupure réseau (1006…) : backoff agressif surtout pour les scouts
+                # (chaque reconnexion = 1 session WS sur le plan Sandbox).
                 delay = self._reconnect_delay
-                self._reconnect_delay = min(self._reconnect_delay * 1.5, 90.0)
-                # Live AZLive encore ouvert → reconnecter vite pour vérifier / clôturer.
-                try:
-                    close_old_connections()
-                    if _find_active_tiktok_live_for_streamer(self.unique_id):
-                        delay = min(delay, 10.0)
-                except Exception:
-                    pass
+                self._reconnect_delay = min(self._reconnect_delay * 1.8, 180.0 if self.scout else 90.0)
+                if self.scout:
+                    delay = max(delay, 60.0)
+                else:
+                    # Live AZLive encore ouvert → reconnecter plus vite pour clôturer.
+                    try:
+                        close_old_connections()
+                        if _find_active_tiktok_live_for_streamer(self.unique_id):
+                            delay = min(delay, 15.0)
+                    except Exception:
+                        pass
 
             logger.info(
                 'TikTools WS reconnexion @%s dans %.0fs (dernier code=%s)',
@@ -1059,7 +1085,7 @@ class _TikToolLiveListener(threading.Thread):
     def _on_error(self, _ws, error):
         err_txt = str(error or '')
         if '4429' in err_txt or 'rate limit' in err_txt.lower():
-            _mark_ws_rate_limited(3600.0)
+            _mark_ws_rate_limited()
             self._last_close_code = 4429
         logger.warning('TikTools WebSocket error (@%s / live #%s): %s', self.unique_id, self.live_id, error)
 
@@ -1067,7 +1093,7 @@ class _TikToolLiveListener(threading.Thread):
         self._last_close_code = close_status_code
         reason = str(close_msg or '')
         if close_status_code == 4429 or 'rate limit' in reason.lower():
-            _mark_ws_rate_limited(3600.0)
+            _mark_ws_rate_limited()
 
         # Uniquement les codes fin explicites TikTools — PAS 1006 (coupure réseau
         # fréquente qui tuait la détection de début juste après roomInfo).
@@ -1172,9 +1198,16 @@ def ensure_tiktok_scouts(*, vendeur_id: int | None = None) -> int:
         print(f'\n[TIKTOOL] {msg}\n', flush=True)
         return 0
     if _tiktool_ws_is_rate_limited():
+        remaining = tiktool_ws_rate_limit_remaining_seconds()
         logger.warning(
-            'ensure_tiktok_scouts ignoré : quota WS horaire (reste ~%.0fs)',
-            tiktool_ws_rate_limit_remaining_seconds(),
+            'ensure_tiktok_scouts ignoré : quota WS (reste ~%.0fs) — '
+            'le watchdog utilisera le REST pour détecter les lives',
+            remaining,
+        )
+        print(
+            f'\n[TIKTOOL] Scout WS en pause (reste ~{remaining:.0f}s). '
+            f'Détection via REST active.\n',
+            flush=True,
         )
         return 0
     started = 0
@@ -1593,8 +1626,41 @@ def sync_external_tiktok_lives(
 
 
 def recover_tiktool_listeners() -> int:
-    """Relance les scouts TikTok + listeners des lives encore en cours après redémarrage Django."""
+    """Relance les scouts TikTok + listeners des lives encore en cours après redémarrage Django.
+
+    Si le quota WebSocket (4429) est atteint : bascule sur la détection REST
+    (`live_status` / `room_id`) pour que les lives TikTok restent détectables
+    pendant la pause WS — c'était la cause du « ne détecte plus depuis hier ».
+    """
     restarted = 0
+
+    if _tiktool_ws_is_rate_limited():
+        remaining = tiktool_ws_rate_limit_remaining_seconds()
+        logger.warning(
+            'TikTools WS en pause (reste ~%.0fs) — détection via REST (pas de nouvelle connexion WS)',
+            remaining,
+        )
+        print(
+            f'\n[TIKTOOL] Quota WS atteint (reste ~{remaining:.0f}s). '
+            f'Détection live via REST en attendant…\n',
+            flush=True,
+        )
+        try:
+            result = sync_external_tiktok_lives(
+                rest=True,
+                wait_ws_seconds=0,
+                min_interval_seconds=90.0,
+            )
+            restarted += int(result.get('started') or 0)
+            if result.get('started'):
+                logger.info(
+                    'REST fallback TikTok : %s live(s) démarré(s) pendant pause WS',
+                    result.get('started'),
+                )
+        except Exception:
+            logger.exception('REST fallback TikTok a échoué pendant pause WS')
+        return restarted
+
     try:
         restarted += ensure_tiktok_scouts()
     except Exception:

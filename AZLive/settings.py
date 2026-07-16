@@ -306,6 +306,8 @@ AZLIVE_PUBLIC_ORDER_BASE_URL = os.environ.get(
 
 # TikTools — commentaires live TikTok en temps réel
 TIKTOOL_API_KEY = os.environ.get('TIKTOOL_API_KEY', '')
+# Pause après un close WS 4429 (quota Sandbox). Pendant ce temps, détection via REST.
+TIKTOOL_WS_COOLDOWN_SECONDS = float(os.environ.get('TIKTOOL_WS_COOLDOWN_SECONDS', '3600'))
 # Cookies session TikTok du compte streamer (sessionid + tt-target-idc) pour répondre dans le chat live
 TIKTOK_SESSION_COOKIES = os.environ.get('TIKTOK_SESSION_COOKIES', '')
 
