@@ -136,6 +136,19 @@ class ProduitSerializer(serializers.ModelSerializer):
         model = Produit
         fields = ['id', 'nom', 'photo', 'photo_url', 'images', 'vendeur', 'vendeur_id', 'variantes']
 
+    def _get_primary_image(self, obj):
+        # Réutilise le cache prefetch_related('images') de la vue (pas de requête SQL supplémentaire).
+        images = sorted(obj.images.all(), key=lambda img: (img.created_at, img.id))
+        if images:
+            return images[0].image
+        return obj.photo
+
+    def get_photo(self, obj):
+        return build_image_absolute_url(self._get_primary_image(obj), self.context.get('request'))
+
+    def get_photo_url(self, obj):
+        return self.get_photo(obj)
+
 
 class ProduitCompactSerializer(serializers.ModelSerializer):
     variantes = VarianteNestedSerializer(many=True, required=False)
