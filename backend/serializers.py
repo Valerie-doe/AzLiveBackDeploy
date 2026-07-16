@@ -124,32 +124,6 @@ class ProduitImageSerializer(serializers.ModelSerializer):
         return data
 
 
-class ProduitSerializer(serializers.ModelSerializer):
-    vendeur = VendeurSerializer(read_only=True)
-    vendeur_id = serializers.PrimaryKeyRelatedField(queryset=Vendeur.objects.all(), source='vendeur', write_only=True)
-    variantes = VarianteNestedSerializer(many=True, required=False)
-    images = ProduitImageSerializer(many=True, read_only=True)
-    photo = serializers.SerializerMethodField()
-    photo_url = serializers.SerializerMethodField()
-
-    class Meta:
-        model = Produit
-        fields = ['id', 'nom', 'photo', 'photo_url', 'images', 'vendeur', 'vendeur_id', 'variantes']
-
-    def _get_primary_image(self, obj):
-        # Réutilise le cache prefetch_related('images') de la vue (pas de requête SQL supplémentaire).
-        images = sorted(obj.images.all(), key=lambda img: (img.created_at, img.id))
-        if images:
-            return images[0].image
-        return obj.photo
-
-    def get_photo(self, obj):
-        return build_image_absolute_url(self._get_primary_image(obj), self.context.get('request'))
-
-    def get_photo_url(self, obj):
-        return self.get_photo(obj)
-
-
 class ProduitCompactSerializer(serializers.ModelSerializer):
     variantes = VarianteNestedSerializer(many=True, required=False)
     photo = serializers.SerializerMethodField()
@@ -303,6 +277,20 @@ class ProduitCompactSerializer(serializers.ModelSerializer):
         if variantes_data is not None:
             self._sync_variantes(instance, variantes_data)
         return instance
+
+
+class ProduitSerializer(ProduitCompactSerializer):
+    """Version complète (CRUD) de ProduitCompactSerializer : ajoute vendeur/images et
+    hérite de create()/update()/_sync_images()/_sync_variantes() pour la création et
+    la modification de produits (dressing, page Produits)."""
+
+    vendeur = VendeurSerializer(read_only=True)
+    vendeur_id = serializers.PrimaryKeyRelatedField(queryset=Vendeur.objects.all(), source='vendeur', write_only=True)
+    images = ProduitImageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Produit
+        fields = ['id', 'nom', 'photo', 'photo_url', 'images', 'vendeur', 'vendeur_id', 'variantes']
 
 
 def _commande_prix(commande):
