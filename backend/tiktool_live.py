@@ -337,10 +337,21 @@ def _tiktool_get(url: str, params: dict[str, str]) -> dict[str, Any] | None:
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.loads(response.read().decode('utf-8', errors='replace'))
     except urllib.error.HTTPError as exc:
+        body = ''
+        try:
+            body = exc.read().decode('utf-8', errors='replace')[:300]
+        except Exception:
+            pass
         if exc.code == 429:
             _mark_rate_limited(90.0)
             return None
-        logger.warning('TikTools GET %s failed: %s', url, exc)
+        logger.warning(
+            'TikTools GET %s failed: %s (params=%s body=%s)',
+            url,
+            exc,
+            {k: v for k, v in params.items() if k != 'apiKey'},
+            body or '-',
+        )
         return None
     except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
         logger.warning('TikTools GET %s failed: %s', url, exc)
@@ -365,10 +376,21 @@ def _tiktool_post(url: str, body: dict[str, Any]) -> dict[str, Any] | None:
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.loads(response.read().decode('utf-8', errors='replace'))
     except urllib.error.HTTPError as exc:
+        err_body = ''
+        try:
+            err_body = exc.read().decode('utf-8', errors='replace')[:300]
+        except Exception:
+            pass
         if exc.code == 429:
             _mark_rate_limited(90.0)
             return None
-        logger.warning('TikTools POST %s failed: %s', url, exc)
+        logger.warning(
+            'TikTools POST %s failed: %s (body_sent=%s resp=%s)',
+            url,
+            exc,
+            {k: body.get(k) for k in ('unique_id', 'uniqueId', 'room_id') if k in body},
+            err_body or '-',
+        )
         return None
     except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
         logger.warning('TikTools POST %s failed: %s', url, exc)
@@ -399,29 +421,35 @@ def _extract_room_id(payload: dict[str, Any] | None) -> str | None:
 
 
 def _check_live_via_live_status(unique_id: str) -> tuple[bool | None, str | None]:
-    """Pré-check relay TikTools (cache ~90s).
+    """GET /webcast/live_status — pré-check recommandé par TikTools (relay).
 
-    Retourne `(is_live, room_id)` :
-    - True si `is_live` est True (assez fiable)
-    - False si `is_live` est False (peut être un cache stale — à confirmer)
-    - (None, …) si la requête a échoué ou le champ est absent
+    Accepte uniqueId et unique_id (docs TikTools).
     """
-    payload = _tiktool_get(TIKTOOL_LIVE_STATUS_URL, {'unique_id': unique_id})
+    # Les deux noms de param : la doc utilise parfois uniqueId, parfois unique_id.
+    payload = _tiktool_get(
+        TIKTOOL_LIVE_STATUS_URL,
+        {'uniqueId': unique_id, 'unique_id': unique_id},
+    )
     room_id = _extract_room_id(payload)
     if not payload:
         return None, room_id
     data = payload.get('data')
     if isinstance(data, dict) and 'is_live' in data:
-        return bool(data.get('is_live')), room_id
+        return bool(data.get('is_live')), room_id or _extract_room_id({'data': data})
     return _parse_live_state(payload), room_id
 
 
 def _check_live_via_room_id(unique_id: str) -> tuple[bool | None, str | None]:
-    """POST /webcast/room_id — résolution serveur TikTools, sans scrape HTML.
+    """POST /webcast/room_id — résolution serveur TikTools.
 
-    Sur sandbox un False+cached peut être stale → None plutôt que False.
+    Sur Sandbox (Railway / IP datacenter) cet endpoint échoue souvent en 404 :
+    la résolution live est moins fiable hors plans Pro+. Dans ce cas on retourne
+    None (indéterminé) pour laisser live_status décider.
     """
-    payload = _tiktool_post(TIKTOOL_ROOM_ID_URL, {'unique_id': unique_id})
+    payload = _tiktool_post(
+        TIKTOOL_ROOM_ID_URL,
+        {'unique_id': unique_id, 'uniqueId': unique_id},
+    )
     room_id = _extract_room_id(payload)
     if not payload:
         return None, room_id
@@ -449,20 +477,6 @@ def _check_live_via_room_info(unique_id: str) -> tuple[bool | None, str | None]:
     if state is True:
         return True, room_id
     return None, room_id
-
-
-def _extract_room_id_from_resolve(payload: dict[str, Any]) -> tuple[str | None, str]:
-    """Ancien scrape HTML TikTok — désactivé (WAF Slardar bloqué depuis un serveur).
-
-    Utiliser POST /webcast/room_id / room_info + scouts WebSocket à la place.
-    """
-    resolve_url = str(payload.get('resolve_url') or '')
-    if resolve_url:
-        logger.info(
-            'check_alive resolve_required ignoré (scrape HTML désactivé, WAF) : %s',
-            resolve_url,
-        )
-    return None, 'waf'
 
 
 def _parse_live_state(payload: dict[str, Any]) -> bool | None:
@@ -517,27 +531,75 @@ def _check_alive_for_room(room_id: str) -> bool | None:
     return _resolve_signed_live_state(payload)
 
 
-def confirm_streamer_is_live(unique_id: str) -> bool | None:
-    """Confirmation fiable qu'un compte est EN live (POST room_id, alive frais).
+def _detect_live_status(unique_id: str) -> tuple[bool | None, str | None]:
+    """Détection live robuste (ordre TikTools recommandé).
 
-    - True  : alive=True (création Live AZLive autorisée)
-    - False : alive=False non-caché (offline confirmé)
-    - None  : indéterminé (quota, cache stale, erreur) → ne rien faire
+    1) live_status (rapide, adapté serveur)
+    2) room_id (peut 404 en Sandbox depuis Railway)
+    3) check_alive en dernier recours
+    """
+    normalized = normalize_tiktok_username(unique_id)
+
+    status_hint, room_id = _check_live_via_live_status(normalized)
+    if status_hint is True:
+        logger.info('TikTok @%s : live_status=True (room=%s)', normalized, room_id)
+        return True, room_id
+    if status_hint is False:
+        # Cache peut être stale → tenter room_id une fois.
+        room_hint, room_id2 = _check_live_via_room_id(normalized)
+        if room_hint is True:
+            return True, room_id2 or room_id
+        if room_hint is False:
+            return False, room_id2 or room_id
+        logger.info(
+            'TikTok @%s : live_status=False, room_id indéterminé — statut=None',
+            normalized,
+        )
+        return None, room_id
+
+    # live_status failed/absent → room_id
+    room_hint, room_id = _check_live_via_room_id(normalized)
+    if room_hint is not None:
+        return room_hint, room_id
+
+    # Dernier recours
+    if room_id:
+        alive = _check_alive_for_room(room_id)
+        if alive is not None:
+            return alive, room_id
+    payload = _request_check_alive(unique_id=normalized)
+    if payload:
+        state = _parse_live_state(payload)
+        if state is not None:
+            return state, _extract_room_id(payload) or room_id
+    logger.warning(
+        'TikTok @%s : détection REST indéterminée (live_status/room_id échoués). '
+        'Sandbox Railway : lance le live manuellement + « Activer capture JP ».',
+        normalized,
+    )
+    return None, room_id
+
+
+def confirm_streamer_is_live(unique_id: str) -> bool | None:
+    """Confirmation qu'un compte est EN live.
+
+    - True  : live confirmé
+    - False : offline confirmé
+    - None  : indéterminé → ne rien faire
     """
     if not tiktool_configured() or _tiktool_is_rate_limited():
         return None
     normalized = normalize_tiktok_username(unique_id)
     if not _is_valid_unique_id(normalized):
         return None
-    return _check_live_via_room_id(normalized)[0]
+    return _detect_live_status(normalized)[0]
 
 
 def confirm_streamer_is_offline(unique_id: str) -> bool | None:
     """Confirmation fiable qu'un compte est HORS live.
 
-    Ne se fie JAMAIS à `live_status=False` seul (cache ~90s → fausses clôtures).
-    - True  : offline confirmé (room_id alive=False frais)
-    - False : encore en live (room_id alive=True)
+    - True  : offline confirmé
+    - False : encore en live
     - None  : indéterminé → ne pas clôturer
     """
     hint = confirm_streamer_is_live(unique_id)
@@ -549,12 +611,7 @@ def confirm_streamer_is_offline(unique_id: str) -> bool | None:
 
 
 def check_streamer_is_live(unique_id: str, *, deep: bool = False) -> bool | None:
-    """Statut live TikTok.
-
-    - deep=True (recommandé pour créer un live) : POST `room_id` uniquement.
-    - deep=False : `live_status` n'est plus utilisé pour un True (cache stale).
-      On confirme toujours via room_id si le cache dit True.
-    """
+    """Statut live TikTok (live_status prioritaire, room_id en secours)."""
     if not tiktool_configured() or _tiktool_is_rate_limited():
         return None
     normalized = normalize_tiktok_username(unique_id)
@@ -564,16 +621,7 @@ def check_streamer_is_live(unique_id: str, *, deep: bool = False) -> bool | None
             unique_id,
         )
         return None
-
-    if deep:
-        return _check_live_via_room_id(normalized)[0]
-
-    # Light : ne jamais créer un live sur un True de cache seul.
-    status_hint, _room_id = _check_live_via_live_status(normalized)
-    if status_hint is True:
-        return _check_live_via_room_id(normalized)[0]
-    # False / None en cache → indéterminé (évite fausse clôture / fausse création).
-    return None
+    return _detect_live_status(normalized)[0]
 
 
 def build_tiktok_diffusion(live: Live) -> dict[str, Any] | None:
