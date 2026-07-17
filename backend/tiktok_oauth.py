@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 import secrets
 import urllib.error
@@ -13,6 +14,8 @@ from django.core.signing import BadSignature, Signer
 
 from .facebook_oauth import issue_auth_token
 from .models import Vendeur
+
+logger = logging.getLogger(__name__)
 
 STATE_SIGNER = Signer(salt='azlive-tiktok-oauth-state')
 PUBLIC_STATE_SIGNER = Signer(salt='azlive-tiktok-public-order')
@@ -151,12 +154,12 @@ def get_or_create_vendeur_from_tiktok(profile: dict[str, Any], token_payload: di
     if not open_id:
         raise TikTokOAuthError('Identifiant TikTok manquant.')
 
-    from .jp_capture import normalize_tiktok_username
+    from .jp_capture import normalize_tiktok_username, resolve_vendeur_from_tiktok_username
 
     display_name = profile.get('display_name') or 'Vendeur TikTok'
     username = (profile.get('username') or '').strip()
-    # Ne jamais stocker le display_name (souvent avec emoji/espaces) comme @TikTok.
-    # Sans username OAuth, on conserve l'existant s'il est valide.
+    # `nom` = display_name (ex. AZ+🇲🇬). `tiktok_username` = unique_id (ex. @azplus.mg).
+    # Ne jamais copier le display_name dans tiktok_username.
     tiktok_username = f'@{username.lstrip("@")}' if username else ''
 
     def _is_valid_handle(value: str) -> bool:
@@ -166,10 +169,22 @@ def get_or_create_vendeur_from_tiktok(profile: dict[str, Any], token_payload: di
     refresh_token = token_payload.get('refresh_token')
 
     existing = Vendeur.objects.filter(tiktok_open_id=open_id).select_related('user').first()
+    # Cas fréquent : @ déjà saisi via /vendeurs/connect/ sans open_id → rattacher OAuth.
+    if existing is None and tiktok_username and _is_valid_handle(tiktok_username):
+        by_handle = resolve_vendeur_from_tiktok_username(tiktok_username)
+        if by_handle is not None and not by_handle.tiktok_open_id:
+            existing = by_handle
+            logger.info(
+                'OAuth TikTok : rattache open_id au vendeur #%s (@%s) déjà présent sans OAuth',
+                by_handle.pk,
+                normalize_tiktok_username(tiktok_username),
+            )
+
     if existing:
+        existing.tiktok_open_id = open_id
         existing.tiktok_access_token = access_token
         existing.tiktok_refresh_token = refresh_token
-        update_fields = ['tiktok_access_token', 'tiktok_refresh_token']
+        update_fields = ['tiktok_open_id', 'tiktok_access_token', 'tiktok_refresh_token']
         if tiktok_username and _is_valid_handle(tiktok_username):
             existing.tiktok_username = tiktok_username
             update_fields.append('tiktok_username')
@@ -181,6 +196,12 @@ def get_or_create_vendeur_from_tiktok(profile: dict[str, Any], token_payload: di
             existing.nom = display_name
             update_fields.append('nom')
         existing.save(update_fields=update_fields)
+        logger.info(
+            'OAuth TikTok OK vendeur #%s : open_id=oui username=%r nom=%r',
+            existing.pk,
+            existing.tiktok_username,
+            existing.nom,
+        )
         user = existing.user
         if not user:
             user = _create_user_for_vendeur(existing, open_id, display_name)
@@ -194,14 +215,21 @@ def get_or_create_vendeur_from_tiktok(profile: dict[str, Any], token_payload: di
     user.set_unusable_password()
     user.save()
 
+    handle_to_store = tiktok_username if (tiktok_username and _is_valid_handle(tiktok_username)) else None
     vendeur = Vendeur.objects.create(
         user=user,
         nom=display_name,
         contact='',
         tiktok_open_id=open_id,
-        tiktok_username=tiktok_username if (tiktok_username and _is_valid_handle(tiktok_username)) else None,
+        tiktok_username=handle_to_store,
         tiktok_access_token=access_token,
         tiktok_refresh_token=refresh_token,
+    )
+    logger.info(
+        'OAuth TikTok créé vendeur #%s : open_id=oui username=%r nom=%r',
+        vendeur.pk,
+        vendeur.tiktok_username,
+        vendeur.nom,
     )
     return vendeur, user, True
 

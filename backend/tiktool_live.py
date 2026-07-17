@@ -309,19 +309,26 @@ def resolve_vendeur_tiktok_unique_id(vendeur: Vendeur) -> str | None:
 
 
 def iter_connected_tiktok_vendeurs(*, vendeur_id: int | None = None):
-    """Vendeurs avec TikTok OAuth connecté + handle détectable."""
-    qs = (
-        Vendeur.objects.exclude(tiktok_open_id__isnull=True)
-        .exclude(tiktok_open_id='')
-        .exclude(is_demo_mode=True)
-        .order_by('id')
-    )
+    """Vendeurs surveillables : OAuth (open_id) OU @TikTok valide déjà enregistré.
+
+    Préférence OAuth, mais un @ valide (ex. après /vendeurs/connect/) suffit pour
+    la détection REST — sinon le scout logge « aucun open_id » alors que le @ est bon.
+    """
+    qs = Vendeur.objects.exclude(is_demo_mode=True).order_by('id')
     if vendeur_id is not None:
         qs = qs.filter(pk=vendeur_id)
     for vendeur in qs:
         unique_id = resolve_vendeur_tiktok_unique_id(vendeur)
-        if unique_id:
-            yield vendeur, unique_id
+        if not unique_id:
+            continue
+        if not (vendeur.tiktok_open_id or '').strip():
+            logger.warning(
+                'Vendeur #%s @%s : détection sans tiktok_open_id '
+                '(reconnecte TikTok OAuth pour lier le compte)',
+                vendeur.pk,
+                unique_id,
+            )
+        yield vendeur, unique_id
 
 
 def _tiktool_get(url: str, params: dict[str, str]) -> dict[str, Any] | None:
@@ -1603,24 +1610,33 @@ def ensure_tiktok_scouts(*, vendeur_id: int | None = None) -> int:
     started = 0
     connected = list(iter_connected_tiktok_vendeurs(vendeur_id=vendeur_id))
     if not connected:
-        # Explique pourquoi la détection « ne marche pas » alors que OAuth OK.
-        qs = Vendeur.objects.exclude(tiktok_open_id__isnull=True).exclude(tiktok_open_id='')
+        # Explique pourquoi la détection « ne marche pas ».
+        qs = Vendeur.objects.exclude(is_demo_mode=True)
         if vendeur_id is not None:
             qs = qs.filter(pk=vendeur_id)
         details = []
-        for v in qs[:10]:
+        for v in qs[:15]:
             raw = v.tiktok_username or ''
             norm = normalize_tiktok_username(raw)
+            has_oid = bool((v.tiktok_open_id or '').strip())
             if not raw:
                 reason = 'tiktok_username vide'
             elif not _is_valid_unique_id(norm):
-                reason = f'handle invalide {raw!r} (attendu ex. azplus.mg)'
+                reason = (
+                    f'handle invalide {raw!r} — c\'est peut-être le nom d\'affichage '
+                    f'(ex. AZ+🇲🇬) au lieu du @ (ex. azplus.mg)'
+                )
             else:
-                reason = 'ok mais non résolu'
+                reason = f'@{norm} ok'
+            reason += f', open_id={"oui" if has_oid else "NON"}'
             details.append(f'#{v.pk}:{reason}')
         msg = (
-            'TikTools: 0 scout — aucun compte OAuth avec @ valide. '
-            + ('; '.join(details) if details else 'Aucun vendeur avec tiktok_open_id.')
+            'TikTools: 0 scout — aucun compte avec @TikTok valide. '
+            + (
+                '; '.join(details)
+                if details
+                else 'Aucun vendeur en base.'
+            )
         )
         logger.warning(msg)
         print(f'\n[TIKTOOL] {msg}\n', flush=True)

@@ -28,13 +28,18 @@ class PageFacebookSerializer(serializers.ModelSerializer):
 
 class VendeurSerializer(serializers.ModelSerializer):
     pages_facebook = PageFacebookSerializer(many=True, read_only=True)
+    # Booléen seulement (pas l'open_id brut) — pour vérifier que l'OAuth est bien en base.
+    tiktok_connected = serializers.SerializerMethodField()
 
     class Meta:
         model = Vendeur
         fields = [
             'id', 'nom', 'contact', 'user', 'facebook_page_id', 'facebook_page_name',
-            'tiktok_username', 'is_demo_mode', 'pages_facebook'
+            'tiktok_username', 'tiktok_connected', 'is_demo_mode', 'pages_facebook'
         ]
+
+    def get_tiktok_connected(self, obj):
+        return bool((obj.tiktok_open_id or '').strip())
 
 
 class CollaborateurSerializer(serializers.ModelSerializer):
