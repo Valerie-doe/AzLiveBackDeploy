@@ -32,8 +32,8 @@ TIKTOOL_ROOM_INFO_URL = 'https://api.tik.tools/webcast/room_info'
 # Codes TikTools = fin de live explicite (doc v3.2).
 _WS_STREAM_END_CODES = {4005, 4006, 4555, 4404}
 
-# Signaux d'activité pendant un live (viewers, chat, gifts…).
-_LIVE_ACTIVITY_EVENTS = frozenset({
+# Signaux FORTS : prouvent un live réel (chat, dons, démarrage explicite…).
+_STRONG_LIVE_EVENTS = frozenset({
     'chat',
     'gift',
     'member',
@@ -46,13 +46,25 @@ _LIVE_ACTIVITY_EVENTS = frozenset({
     'stream_start',
     'liveStart',
     'live_start',
+})
+
+# Signaux FAIBLES : handshake TikTools (souvent envoyés hors live / room stale).
+# Ne doivent JAMAIS créer un Live AZLive sans confirmation REST room_id.
+_WEAK_LIVE_EVENTS = frozenset({
     'roomUserSeq',
     'WebcastRoomUserSeqMessage',
 })
 
+# Rétrocompat : union utilisée pour « note activity » une fois le live déjà ouvert.
+_LIVE_ACTIVITY_EVENTS = _STRONG_LIVE_EVENTS | _WEAK_LIVE_EVENTS
+
 _listeners: dict[int, '_TikToolLiveListener'] = {}
 _scouts: dict[str, '_TikToolLiveListener'] = {}
 _listeners_lock = threading.Lock()
+# File d'attente pool WS : lives qui veulent un slot quand le max est atteint.
+# Chaque entrée = (live_id, unique_id). FIFO.
+_ws_pending: list[tuple[int, str]] = []
+_ws_pending_live_ids: set[int] = set()
 _last_tiktok_sync_at: datetime | None = None
 _tiktok_sync_lock = threading.Lock()
 _last_vendeur_sync_at: dict[int, datetime] = {}
@@ -94,6 +106,125 @@ def _ws_cooldown_seconds(default: float = 3600.0) -> float:
         return max(float(getattr(settings, 'TIKTOOL_WS_COOLDOWN_SECONDS', default) or default), 300.0)
     except (TypeError, ValueError):
         return max(default, 300.0)
+
+
+def _ws_mode() -> str:
+    """always = scout permanent ; on_demand = WS seulement pendant un live (économie quota)."""
+    mode = str(getattr(settings, 'TIKTOOL_WS_MODE', 'on_demand') or 'on_demand').strip().lower()
+    if mode in {'always', 'permanent', 'scout'}:
+        return 'always'
+    return 'on_demand'
+
+
+def _ws_on_demand() -> bool:
+    return _ws_mode() == 'on_demand'
+
+
+def _ws_max_connections() -> int:
+    """Plafond de WebSockets TikTools ouverts en parallèle (pool)."""
+    try:
+        return max(1, int(getattr(settings, 'TIKTOOL_WS_MAX_CONNECTIONS', 2) or 2))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _ws_active_unique_ids_locked() -> set[str]:
+    """Unique_ids ayant un thread WS vivant (scout ou listener)."""
+    active: set[str] = set()
+    for unique_id, scout in _scouts.items():
+        if scout is not None and scout.is_alive() and not scout.stop_event.is_set():
+            active.add(unique_id)
+    for listener in _listeners.values():
+        if listener is not None and listener.is_alive() and not listener.stop_event.is_set():
+            active.add(listener.unique_id)
+    return active
+
+
+def _ws_active_count_locked() -> int:
+    return len(_ws_active_unique_ids_locked())
+
+
+def _ws_pool_has_slot_locked() -> bool:
+    return _ws_active_count_locked() < _ws_max_connections()
+
+
+def _ws_enqueue_pending_locked(live_id: int, unique_id: str) -> int:
+    """Ajoute un live en file d'attente pool. Retourne la position 1-based."""
+    if live_id in _ws_pending_live_ids:
+        for idx, (lid, _) in enumerate(_ws_pending):
+            if lid == live_id:
+                return idx + 1
+        return len(_ws_pending)
+    _ws_pending.append((live_id, unique_id))
+    _ws_pending_live_ids.add(live_id)
+    return len(_ws_pending)
+
+
+def _ws_remove_pending_locked(live_id: int) -> None:
+    global _ws_pending
+    if live_id not in _ws_pending_live_ids:
+        return
+    _ws_pending = [(lid, uid) for lid, uid in _ws_pending if lid != live_id]
+    _ws_pending_live_ids.discard(live_id)
+
+
+def _ws_promote_pending_locked() -> int:
+    """Ouvre des WS pour les lives en file tant qu'il reste des slots.
+
+    À appeler sous `_listeners_lock`, typiquement après libération d'un slot.
+    """
+    promoted = 0
+    while _ws_pool_has_slot_locked() and _ws_pending:
+        live_id, unique_id = _ws_pending.pop(0)
+        _ws_pending_live_ids.discard(live_id)
+        try:
+            close_old_connections()
+            live = (
+                Live.objects.filter(pk=live_id, statut=Live.STATUT_EN_COURS)
+                .select_related('vendeur')
+                .first()
+            )
+        except Exception:
+            logger.exception('Pool WS : impossible de recharger live #%s', live_id)
+            continue
+        if live is None:
+            logger.info('Pool WS : live #%s plus en cours — retiré de la file', live_id)
+            continue
+        existing = _scouts.get(unique_id)
+        if existing and existing.is_alive() and not existing.stop_event.is_set():
+            existing.live_id = live_id
+            _listeners[live_id] = existing
+            promoted += 1
+            continue
+        _start_listener_locked(unique_id, live_id, scout=True)
+        promoted += 1
+        logger.info(
+            'Pool WS : slot libre → démarrage live #%s (@%s) '
+            '(actifs=%s/%s, file=%s)',
+            live_id,
+            unique_id,
+            _ws_active_count_locked(),
+            _ws_max_connections(),
+            len(_ws_pending),
+        )
+    return promoted
+
+
+def tiktool_ws_pool_status() -> dict[str, Any]:
+    """État du pool WS (debug / monitoring)."""
+    with _listeners_lock:
+        active_ids = sorted(_ws_active_unique_ids_locked())
+        pending = list(_ws_pending)
+    return {
+        'mode': _ws_mode(),
+        'max_connections': _ws_max_connections(),
+        'active': len(active_ids),
+        'active_unique_ids': active_ids,
+        'pending': len(pending),
+        'pending_live_ids': [lid for lid, _ in pending],
+        'ws_rate_limited': _tiktool_ws_is_rate_limited(),
+        'ws_rate_limit_remaining_seconds': round(tiktool_ws_rate_limit_remaining_seconds(), 1),
+    }
 
 
 def _mark_ws_rate_limited(seconds: float | None = None) -> None:
@@ -381,13 +512,43 @@ def _check_alive_for_room(room_id: str) -> bool | None:
     return _resolve_signed_live_state(payload)
 
 
+def confirm_streamer_is_live(unique_id: str) -> bool | None:
+    """Confirmation fiable qu'un compte est EN live (POST room_id, alive frais).
+
+    - True  : alive=True (création Live AZLive autorisée)
+    - False : alive=False non-caché (offline confirmé)
+    - None  : indéterminé (quota, cache stale, erreur) → ne rien faire
+    """
+    if not tiktool_configured() or _tiktool_is_rate_limited():
+        return None
+    normalized = normalize_tiktok_username(unique_id)
+    if not _is_valid_unique_id(normalized):
+        return None
+    return _check_live_via_room_id(normalized)[0]
+
+
+def confirm_streamer_is_offline(unique_id: str) -> bool | None:
+    """Confirmation fiable qu'un compte est HORS live.
+
+    Ne se fie JAMAIS à `live_status=False` seul (cache ~90s → fausses clôtures).
+    - True  : offline confirmé (room_id alive=False frais)
+    - False : encore en live (room_id alive=True)
+    - None  : indéterminé → ne pas clôturer
+    """
+    hint = confirm_streamer_is_live(unique_id)
+    if hint is True:
+        return False
+    if hint is False:
+        return True
+    return None
+
+
 def check_streamer_is_live(unique_id: str, *, deep: bool = False) -> bool | None:
-    """Statut live TikTok — **1 seul appel REST** max (quota sandbox 20/min).
+    """Statut live TikTok.
 
-    - light : GET `live_status` (cache relay, gratuit côté TikTok mais compte au quota)
-    - deep  : POST `room_id` uniquement (pas de chambre de check_alive / room_info en chaîne)
-
-    Jamais de scrape HTML. Si indéterminé → les scouts WebSocket créent le live.
+    - deep=True (recommandé pour créer un live) : POST `room_id` uniquement.
+    - deep=False : `live_status` n'est plus utilisé pour un True (cache stale).
+      On confirme toujours via room_id si le cache dit True.
     """
     if not tiktool_configured() or _tiktool_is_rate_limited():
         return None
@@ -400,13 +561,13 @@ def check_streamer_is_live(unique_id: str, *, deep: bool = False) -> bool | None
         return None
 
     if deep:
-        room_hint, _fresh = _check_live_via_room_id(normalized)
-        return room_hint
+        return _check_live_via_room_id(normalized)[0]
 
+    # Light : ne jamais créer un live sur un True de cache seul.
     status_hint, _room_id = _check_live_via_live_status(normalized)
     if status_hint is True:
-        return True
-    # False / None en cache → indéterminé (ne consomme pas d'autres crédits).
+        return _check_live_via_room_id(normalized)[0]
+    # False / None en cache → indéterminé (évite fausse clôture / fausse création).
     return None
 
 
@@ -574,8 +735,9 @@ def ensure_tiktok_live_for_streamer(
 ) -> Live | None:
     """Crée/active un Live AZLive quand TikTok est réellement en direct.
 
-    `already_verified=True` : preuve WS (chat / streamStart) — pas de gate REST
-    (indispensable quand TikTools est en 429).
+    - already_verified=False (roomInfo / sync faible) : exige POST room_id alive=True.
+    - already_verified=True (chat / gift / streamStart) : confirme via room_id si
+      possible ; si quota REST, on fait confiance au signal fort WS.
     """
     unique_id = normalize_tiktok_username(streamer_unique_id)
     vendeur = resolve_vendeur_from_tiktok_username(unique_id)
@@ -591,23 +753,34 @@ def ensure_tiktok_live_for_streamer(
         )
         return None
 
-    if not already_verified:
-        # 1 seul appel light — pas de deep (économise le quota). Si bloqué → WS.
-        verified = check_streamer_is_live(unique_id, deep=False)
-        if verified is not True:
-            existing = (
-                Live.objects.filter(vendeur=vendeur, statut=Live.STATUT_EN_COURS)
-                .order_by('-date_live')
-                .first()
-            )
-            if existing is None:
+    existing = (
+        Live.objects.filter(vendeur=vendeur, statut=Live.STATUT_EN_COURS)
+        .order_by('-date_live')
+        .first()
+    )
+    if existing is not None:
+        # Live déjà ouvert : pas de gate REST supplémentaire ici.
+        pass
+    elif already_verified:
+        # Signal fort WS : refuser seulement si room_id dit offline clairement.
+        if not _tiktool_is_rate_limited():
+            verified = _check_live_via_room_id(unique_id)[0]
+            if verified is False:
                 logger.info(
-                    'Pas de création Live pour @%s : live TikTok non confirmé (%s)',
+                    'Pas de création Live pour @%s : signal WS fort mais room_id offline',
                     unique_id,
-                    verified,
                 )
                 return None
-            return existing
+    else:
+        # Signal faible (roomInfo…) : confirmation room_id obligatoire.
+        verified = confirm_streamer_is_live(unique_id)
+        if verified is not True:
+            logger.info(
+                'Pas de création Live pour @%s : live TikTok non confirmé (%s)',
+                unique_id,
+                verified,
+            )
+            return None
 
     now = timezone.now()
 
@@ -718,10 +891,9 @@ def _build_ws_url(unique_id: str) -> str:
 class _TikToolLiveListener(threading.Thread):
     """Scout WS : détection début + fin de live TikTok en parallèle.
 
-    Début : roomInfo (avec roomId) / chat / gift / viewers / streamStart → Live en_cours
-    Fin   : streamEnd / control(action=3) / close 4005|4006|4555|4404
-            + si AZLive encore en_cours après reconnect : pas d'activité réelle en 30s
-              (roomInfo handshake ne compte pas comme « encore live »)
+    Début : chat / gift / streamStart (fort) → create ; roomInfo (faible) → REST room_id
+    Fin   : streamEnd / control(action=3) / close 4005|… confirmés via room_id offline
+            + après reconnect : pas d'activité forte + room_id offline (pas live_status seul)
     """
 
     daemon = True
@@ -740,7 +912,7 @@ class _TikToolLiveListener(threading.Thread):
         self.stop_event = stop_event
         self.scout = scout
         # Scout : départ plus lent pour économiser les sessions WS Sandbox.
-        self._reconnect_delay = 60.0 if scout else 15.0
+        self._reconnect_delay = 120.0 if scout else 20.0
         self._last_close_code: int | None = None
         self._session_saw_live = False
         self._stream_end_event_seen = False
@@ -769,6 +941,20 @@ class _TikToolLiveListener(threading.Thread):
                     break
                 continue
 
+            # Mode économie : hors live AZLive, ne pas ouvrir de WS (REST détecte).
+            if _ws_on_demand():
+                try:
+                    close_old_connections()
+                    active = _find_active_tiktok_live_for_streamer(self.unique_id)
+                except Exception:
+                    active = None
+                if active is None:
+                    logger.info(
+                        'TikTools on_demand : pas de live actif @%s — arrêt WS (0 session)',
+                        self.unique_id,
+                    )
+                    break
+
             ws_app = websocket.WebSocketApp(
                 _build_ws_url(self.unique_id),
                 on_message=self._on_message,
@@ -778,9 +964,22 @@ class _TikToolLiveListener(threading.Thread):
             )
             ws_app.run_forever(ping_interval=30, ping_timeout=10)
 
+            # Après fermeture : en on_demand, stop si plus de live (évite reconnexions).
+            if _ws_on_demand():
+                try:
+                    close_old_connections()
+                    still_active = _find_active_tiktok_live_for_streamer(self.unique_id)
+                except Exception:
+                    still_active = None
+                if still_active is None or self._last_close_code in _WS_STREAM_END_CODES or self._stream_end_event_seen:
+                    logger.info(
+                        'TikTools on_demand : fin WS @%s (live terminé / absent) — pas de reconnexion',
+                        self.unique_id,
+                    )
+                    break
+
             if self._last_close_code in _WS_STREAM_END_CODES or self._stream_end_event_seen:
-                # Fin explicite : retenter bientôt (relance TikTok fréquente).
-                # Scout : délai min plus long pour ne pas brûler le quota sandbox.
+                # Fin explicite : retenter bientôt seulement hors on_demand.
                 delay = 45.0 if self.scout else 8.0
                 self._reconnect_delay = delay
             elif self._last_close_code == 4429 or _tiktool_ws_is_rate_limited():
@@ -790,18 +989,19 @@ class _TikToolLiveListener(threading.Thread):
                     _ws_cooldown_seconds(),
                 )
             else:
-                # Coupure réseau (1006…) : backoff agressif surtout pour les scouts
-                # (chaque reconnexion = 1 session WS sur le plan Sandbox).
+                # Coupure réseau (1006…) : backoff très agressif (1 session = 1 quota).
                 delay = self._reconnect_delay
-                self._reconnect_delay = min(self._reconnect_delay * 1.8, 180.0 if self.scout else 90.0)
+                self._reconnect_delay = min(
+                    self._reconnect_delay * 2.0,
+                    600.0 if self.scout else 180.0,
+                )
                 if self.scout:
-                    delay = max(delay, 60.0)
+                    delay = max(delay, 120.0)
                 else:
-                    # Live AZLive encore ouvert → reconnecter plus vite pour clôturer.
                     try:
                         close_old_connections()
                         if _find_active_tiktok_live_for_streamer(self.unique_id):
-                            delay = min(delay, 15.0)
+                            delay = min(delay, 20.0)
                     except Exception:
                         pass
 
@@ -813,6 +1013,26 @@ class _TikToolLiveListener(threading.Thread):
             )
             if self.stop_event.wait(delay):
                 break
+
+        # Thread terminé : libérer le slot pool + promouvoir la file.
+        self._release_ws_pool_slot()
+
+    def _release_ws_pool_slot(self) -> None:
+        """Retire ce listener des registres et ouvre le prochain live en file."""
+        with _listeners_lock:
+            if _scouts.get(self.unique_id) is self:
+                _scouts.pop(self.unique_id, None)
+            if self.live_id and _listeners.get(self.live_id) is self:
+                _listeners.pop(self.live_id, None)
+            promoted = _ws_promote_pending_locked()
+            if promoted:
+                logger.info(
+                    'Pool WS : @%s libéré → %s live(s) promu(s) (actifs=%s/%s)',
+                    self.unique_id,
+                    promoted,
+                    _ws_active_count_locked(),
+                    _ws_max_connections(),
+                )
 
     def _cancel_proof_timer(self) -> None:
         timer = self._proof_timer
@@ -831,11 +1051,11 @@ class _TikToolLiveListener(threading.Thread):
         self._stream_end_event_seen = False
         self._cancel_proof_timer()
 
-    def _schedule_verify_or_end(self, seconds: float = 30.0) -> None:
+    def _schedule_verify_or_end(self, seconds: float = 45.0) -> None:
         """Après reconnect avec Live AZLive encore ouvert : activité ou clôture.
 
-        roomInfo (handshake) n'annule PAS ce timer — seuls chat/gift/viewers/streamStart.
-        Avant de clôturer : un check REST pour éviter de tuer un live calme.
+        roomInfo / roomUserSeq n'annulent PAS ce timer — seuls chat/gift/streamStart.
+        Clôture uniquement si POST room_id dit offline (jamais live_status seul).
         """
         self._cancel_proof_timer()
         self._got_activity_proof = False
@@ -851,50 +1071,32 @@ class _TikToolLiveListener(threading.Thread):
                     self._verify_still_live = False
                     return
 
-                # Confirmation REST : ne clôture que si offline clairement.
-                status_hint, _room = _check_live_via_live_status(self.unique_id)
-                if status_hint is True:
+                # Confirmation fiable uniquement via room_id (pas live_status cache).
+                offline = confirm_streamer_is_offline(self.unique_id)
+                if offline is False:
                     logger.info(
-                        'Reconnect @%s : live_status encore True → on garde AZLive #%s',
+                        'Reconnect @%s : room_id encore alive → on garde AZLive #%s',
                         self.unique_id,
                         active.pk,
                     )
                     self._note_activity()
                     self.live_id = active.pk
                     return
-                room_hint = None
-                if not _tiktool_is_rate_limited():
-                    room_hint, _fresh = _check_live_via_room_id(self.unique_id)
-                    if room_hint is True:
-                        logger.info(
-                            'Reconnect @%s : room_id encore alive → on garde AZLive #%s',
-                            self.unique_id,
-                            active.pk,
-                        )
-                        self._note_activity()
-                        self.live_id = active.pk
-                        return
-
-                if status_hint is False or room_hint is False:
+                if offline is True:
                     logger.warning(
-                        'Reconnect @%s : pas d\'activité WS + offline (status=%s room=%s) '
+                        'Reconnect @%s : pas d\'activité WS + room_id offline '
                         '→ clôture AZLive #%s',
                         self.unique_id,
-                        status_hint,
-                        room_hint,
                         active.pk,
                     )
                     self.live_id = active.pk
                     self._end_live_from_ws_signal('reconnect_no_activity')
                     return
 
-                # Statut indéterminé (quota / cache) : on ne tue pas ; le watchdog REST réessaiera.
                 logger.info(
                     'Reconnect @%s : aucune activité mais statut indéterminé '
-                    '(status=%s room=%s) — AZLive #%s laissé en_cours',
+                    '— AZLive #%s laissé en_cours',
                     self.unique_id,
-                    status_hint,
-                    room_hint,
                     active.pk,
                 )
                 self._verify_still_live = False
@@ -906,10 +1108,12 @@ class _TikToolLiveListener(threading.Thread):
         self._proof_timer.start()
 
     def _on_open(self, _ws):
-        self._reconnect_delay = 15.0
+        # Ne pas reset à 15s : une session réussie ne doit pas relancer un spam
+        # de reconnexions après le prochain drop réseau.
+        self._reconnect_delay = 120.0 if self.scout else 20.0
         self._last_close_code = None
         self._stream_end_event_seen = False
-        logger.info('TikTools WS connecté (@%s)', self.unique_id)
+        logger.info('TikTools WS connecté (@%s mode=%s)', self.unique_id, _ws_mode())
 
         try:
             close_old_connections()
@@ -920,11 +1124,11 @@ class _TikToolLiveListener(threading.Thread):
                 self._session_saw_live = True
                 logger.info(
                     'Scout @%s : live AZLive #%s encore en_cours — '
-                    'attente activité (chat/gift/viewers) 30s',
+                    'attente activité forte (chat/gift) 45s',
                     self.unique_id,
                     active.pk,
                 )
-                self._schedule_verify_or_end(30.0)
+                self._schedule_verify_or_end(45.0)
             else:
                 # Cas début : roomInfo / chat créera le live dès qu'il démarre.
                 self.live_id = None
@@ -937,24 +1141,70 @@ class _TikToolLiveListener(threading.Thread):
             self._session_saw_live = False
             self._verify_still_live = False
 
-    def _ensure_live_from_ws_signal(self, reason: str) -> None:
-        """Début (ou confirmation) de live → créer/activer sans gate REST."""
-        self._note_activity()
+    def _ensure_live_from_ws_signal(self, reason: str, *, strong: bool = True) -> None:
+        """Début (ou confirmation) de live.
+
+        strong=True  : chat/gift/streamStart — preuve WS + room_id si dispo
+        strong=False : roomInfo/roomUserSeq — exige confirmation REST room_id
+        """
+        if strong:
+            self._note_activity()
         try:
-            live = ensure_tiktok_live_for_streamer(self.unique_id, already_verified=True)
+            live = ensure_tiktok_live_for_streamer(
+                self.unique_id,
+                already_verified=strong,
+            )
             if live:
+                if not strong:
+                    self._note_activity()
                 self.live_id = live.pk
                 logger.info(
-                    'Live AZLive #%s créé/activé via WS %s (@%s)',
+                    'Live AZLive #%s créé/activé via WS %s (@%s strong=%s)',
                     live.pk,
+                    reason,
+                    self.unique_id,
+                    strong,
+                )
+            elif not strong:
+                logger.info(
+                    'WS %s @%s ignoré : room_id non confirmé (pas de création)',
                     reason,
                     self.unique_id,
                 )
         except Exception:
             logger.exception('ensure live via WS %s (@%s)', reason, self.unique_id)
 
+    def _confirm_end_from_ws_signal(self, reason: str) -> None:
+        """Fin WS signalée → clôturer seulement si room_id confirme offline."""
+        try:
+            close_old_connections()
+            offline = confirm_streamer_is_offline(self.unique_id)
+            if offline is False:
+                logger.warning(
+                    'Fin WS %s ignorée @%s : room_id encore alive',
+                    reason,
+                    self.unique_id,
+                )
+                self._stream_end_event_seen = False
+                self._note_activity()
+                return
+            if offline is None:
+                logger.info(
+                    'Fin WS %s @%s indéterminée → verify 45s avant clôture',
+                    reason,
+                    self.unique_id,
+                )
+                active = _find_active_tiktok_live_for_streamer(self.unique_id)
+                if active:
+                    self.live_id = active.pk
+                    self._schedule_verify_or_end(45.0)
+                return
+            self._end_live_from_ws_signal(reason)
+        except Exception:
+            logger.exception('confirm end via WS %s (@%s)', reason, self.unique_id)
+
     def _end_live_from_ws_signal(self, reason: str) -> None:
-        """Fin TikTok → passer le live AZLive en terminé (archives)."""
+        """Fin TikTok confirmée → passer le live AZLive en terminé (archives)."""
         self._cancel_proof_timer()
         self._verify_still_live = False
         try:
@@ -1000,7 +1250,7 @@ class _TikToolLiveListener(threading.Thread):
         if event in {'streamEnd', 'stream_end', 'liveEnd', 'live_end'}:
             logger.info('TikTools streamEnd (@%s) data=%s', self.unique_id, data or payload)
             self._stream_end_event_seen = True
-            self._end_live_from_ws_signal(event)
+            self._confirm_end_from_ws_signal(event)
             return
 
         if event == 'control':
@@ -1011,7 +1261,7 @@ class _TikToolLiveListener(threading.Thread):
             if action == 3:
                 logger.info('TikTools control action=3 stream end (@%s)', self.unique_id)
                 self._stream_end_event_seen = True
-                self._end_live_from_ws_signal('control_stream_end')
+                self._confirm_end_from_ws_signal('control_stream_end')
             return
 
         room_id = (
@@ -1021,10 +1271,9 @@ class _TikToolLiveListener(threading.Thread):
             or data.get('room_id')
         )
 
-        # ——— DÉBUT via roomInfo ———
-        # Handshake avec roomId = créateur en live (détection qui marchait avant).
-        # Exception : en mode verify_still_live (après reconnect), roomInfo seul
-        # ne prouve PAS que le live continue (TikTools l'envoie à chaque connect).
+        # ——— DÉBUT via roomInfo (faible) ———
+        # TikTools envoie souvent un roomInfo+roomId hors live → REST obligatoire.
+        # En verify_still_live : n'annule jamais le timer de fin.
         if event in {'roomInfo', 'room_info'}:
             if self._verify_still_live:
                 logger.debug(
@@ -1035,26 +1284,36 @@ class _TikToolLiveListener(threading.Thread):
                 return
             if not self.live_id and room_id:
                 logger.info(
-                    'TikTools roomInfo → détection début (@%s roomId=%s)',
+                    'TikTools roomInfo → tentative début (@%s roomId=%s, confirm REST)',
                     self.unique_id,
                     room_id,
                 )
-                self._ensure_live_from_ws_signal('roomInfo')
+                self._ensure_live_from_ws_signal('roomInfo', strong=False)
             elif self.live_id and room_id:
-                # Même session encore connectée : simple heartbeat soft.
                 self._session_saw_live = True
             return
 
-        # ——— Activité = début OU confirmation « encore live » ———
-        if event in _LIVE_ACTIVITY_EVENTS and event != 'chat':
+        # ——— Signaux faibles (viewers seq) : jamais preuve « encore live » ———
+        if event in _WEAK_LIVE_EVENTS:
+            if not self.live_id and not self._verify_still_live:
+                logger.info(
+                    'TikTools signal faible (@%s event=%s) → confirm REST',
+                    self.unique_id,
+                    event,
+                )
+                self._ensure_live_from_ws_signal(event, strong=False)
+            return
+
+        # ——— Signaux forts = début OU confirmation « encore live » ———
+        if event in _STRONG_LIVE_EVENTS and event != 'chat':
             if not self.live_id or self._verify_still_live:
                 logger.info(
-                    'TikTools signal live (@%s event=%s roomId=%s)',
+                    'TikTools signal fort (@%s event=%s roomId=%s)',
                     self.unique_id,
                     event,
                     room_id,
                 )
-                self._ensure_live_from_ws_signal(event)
+                self._ensure_live_from_ws_signal(event, strong=True)
             else:
                 self._note_activity()
             return
@@ -1063,7 +1322,7 @@ class _TikToolLiveListener(threading.Thread):
             return
 
         if not self.live_id or self._verify_still_live:
-            self._ensure_live_from_ws_signal('chat')
+            self._ensure_live_from_ws_signal('chat', strong=True)
         else:
             self._note_activity()
 
@@ -1095,8 +1354,8 @@ class _TikToolLiveListener(threading.Thread):
         if close_status_code == 4429 or 'rate limit' in reason.lower():
             _mark_ws_rate_limited()
 
-        # Uniquement les codes fin explicites TikTools — PAS 1006 (coupure réseau
-        # fréquente qui tuait la détection de début juste après roomInfo).
+        # Uniquement les codes fin explicites TikTools — PAS 1006 (coupure réseau).
+        # Même pour ces codes : confirmation room_id (évite fausse clôture).
         should_end = (
             close_status_code in _WS_STREAM_END_CODES
             or self._stream_end_event_seen
@@ -1104,11 +1363,11 @@ class _TikToolLiveListener(threading.Thread):
 
         if should_end:
             close_old_connections()
-            self._end_live_from_ws_signal(f'ws_close_{close_status_code}')
+            self._confirm_end_from_ws_signal(f'ws_close_{close_status_code}')
         else:
             self._cancel_proof_timer()
             # Sur drop réseau avec live encore ouvert : au prochain open,
-            # verify_still_live + 30s d'activité décidera de clôturer ou non.
+            # verify_still_live + activité forte décidera de clôturer ou non.
 
         logger.info(
             'TikTools WebSocket fermé (@%s / live #%s): %s %s',
@@ -1132,11 +1391,18 @@ def _start_listener_locked(unique_id: str, live_id: int | None = None, *, scout:
         if old_live and old_live is not listener and not old_live.scout:
             old_live.stop_event.set()
         _listeners[live_id] = listener
+        _ws_remove_pending_locked(live_id)
     listener.start()
     return listener
 
 
 def start_tiktool_listener(live: Live) -> bool:
+    """Demande un slot WS pour un live.
+
+    - Slot libre → démarre immédiatement
+    - Pool plein → mise en file FIFO (démarrera quand un live libère un slot)
+    - Réutilise un scout déjà ouvert pour le même @ (0 nouvelle session)
+    """
     if not tiktool_configured() or live.vendeur.is_demo_mode:
         return False
 
@@ -1144,37 +1410,105 @@ def start_tiktool_listener(live: Live) -> bool:
     if not username:
         return False
 
+    if _tiktool_ws_is_rate_limited():
+        logger.warning(
+            'Pool WS : live #%s en file d\'attente (quota TikTools 4429, reste ~%.0fs)',
+            live.pk,
+            tiktool_ws_rate_limit_remaining_seconds(),
+        )
+        with _listeners_lock:
+            pos = _ws_enqueue_pending_locked(
+                live.pk,
+                normalize_tiktok_username(username),
+            )
+        logger.info('Pool WS : live #%s position file=%s (attente reset quota)', live.pk, pos)
+        return False
+
     unique_id = normalize_tiktok_username(username)
     with _listeners_lock:
         # Réutilise le scout déjà connecté pour cet unique_id (évite 2 WS).
         scout = _scouts.get(unique_id)
-        if scout and scout.is_alive():
+        if scout and scout.is_alive() and not scout.stop_event.is_set():
             scout.live_id = live.pk
             scout.scout = True
             _listeners[live.pk] = scout
+            _ws_remove_pending_locked(live.pk)
             logger.info('TikTools scout réutilisé pour live #%s (@%s)', live.pk, unique_id)
             return True
 
-        stop_tiktool_listener(live, lock_held=True)
+        # Déjà un WS actif pour un autre compte et pool saturé → file d'attente.
+        already_counted = unique_id in _ws_active_unique_ids_locked()
+        if not already_counted and not _ws_pool_has_slot_locked():
+            pos = _ws_enqueue_pending_locked(live.pk, unique_id)
+            logger.warning(
+                'Pool WS plein (%s/%s) : live #%s (@%s) en file (position %s)',
+                _ws_active_count_locked(),
+                _ws_max_connections(),
+                live.pk,
+                unique_id,
+                pos,
+            )
+            print(
+                f'\n[TIKTOOL] Pool WS plein ({_ws_active_count_locked()}/{_ws_max_connections()}). '
+                f'Live #{live.pk} @{unique_id} en attente (#{pos}).\n',
+                flush=True,
+            )
+            return False
+
+        stop_tiktool_listener(live, lock_held=True, promote=False)
+        if unique_id not in _ws_active_unique_ids_locked() and not _ws_pool_has_slot_locked():
+            pos = _ws_enqueue_pending_locked(live.pk, unique_id)
+            logger.warning(
+                'Pool WS plein après arrêt local (%s/%s) : live #%s en file (#%s)',
+                _ws_active_count_locked(),
+                _ws_max_connections(),
+                live.pk,
+                pos,
+            )
+            return False
         _start_listener_locked(unique_id, live.pk, scout=True)
 
-    logger.info('TikTools listener démarré pour live #%s (@%s)', live.pk, unique_id)
+    logger.info(
+        'TikTools listener démarré pour live #%s (@%s) — pool %s/%s',
+        live.pk,
+        unique_id,
+        tiktool_ws_pool_status()['active'],
+        _ws_max_connections(),
+    )
     return True
 
 
-def stop_tiktool_listener(live: Live, lock_held: bool = False) -> bool:
+def stop_tiktool_listener(
+    live: Live,
+    lock_held: bool = False,
+    *,
+    promote: bool = True,
+) -> bool:
     live_id = live.pk
 
     def _stop():
+        _ws_remove_pending_locked(live_id)
         listener = _listeners.pop(live_id, None)
         if not listener:
+            # Peut être seulement en file d'attente.
             return False
-        # Si c'est aussi le scout du compte, on le détache du live mais on le laisse tourner
-        # pour redécouvrir le prochain direct TikTok.
+        # Scout du compte :
+        # - always     → détacher le live, garder le WS pour le prochain direct
+        # - on_demand  → fermer le WS (économie quota ; REST redétectera)
+        freed = False
         if _scouts.get(listener.unique_id) is listener:
-            listener.live_id = None
+            if _ws_on_demand():
+                listener.stop_event.set()
+                _scouts.pop(listener.unique_id, None)
+                freed = True
+            else:
+                listener.live_id = None
+            if promote and freed:
+                _ws_promote_pending_locked()
             return True
         listener.stop_event.set()
+        if promote:
+            _ws_promote_pending_locked()
         return True
 
     if lock_held:
@@ -1187,7 +1521,10 @@ def stop_tiktool_listener(live: Live, lock_held: bool = False) -> bool:
 def ensure_tiktok_scouts(*, vendeur_id: int | None = None) -> int:
     """Maintient un WebSocket TikTools par compte TikTok **connecté**.
 
-    Ne cible que les vendeurs avec `tiktok_open_id` (OAuth) + unique_id valide.
+    Mode `on_demand` (défaut) : n'ouvre un WS que s'il existe déjà un live EN_COURS
+    pour ce vendeur (la détection hors-live passe par REST → 0 session WS).
+
+    Mode `always` : scout permanent (réactif, mais brûle le quota Sandbox).
     """
     if not tiktool_configured():
         msg = (
@@ -1235,20 +1572,71 @@ def ensure_tiktok_scouts(*, vendeur_id: int | None = None) -> int:
         logger.warning(msg)
         print(f'\n[TIKTOOL] {msg}\n', flush=True)
         return 0
+
+    on_demand = _ws_on_demand()
+    if on_demand:
+        logger.info(
+            'TikTools WS mode=on_demand : scouts seulement pour lives EN_COURS '
+            '(détection hors-live via REST)'
+        )
+
     for vendeur, unique_id in connected:
+        active_live = (
+            Live.objects.filter(vendeur=vendeur, statut=Live.STATUT_EN_COURS)
+            .order_by('-date_live')
+            .first()
+        )
+        if on_demand and active_live is None:
+            # Ferme un éventuel scout orphelin hors live.
+            with _listeners_lock:
+                orphan = _scouts.get(unique_id)
+                if orphan and orphan.is_alive() and orphan.live_id is None:
+                    orphan.stop_event.set()
+                    _scouts.pop(unique_id, None)
+            continue
+
         with _listeners_lock:
             existing = _scouts.get(unique_id)
-            if existing and existing.is_alive():
+            if existing and existing.is_alive() and not existing.stop_event.is_set():
                 continue
-            _start_listener_locked(unique_id, live_id=None, scout=True)
+
+            # Respecter le plafond pool (même en mode always).
+            if unique_id not in _ws_active_unique_ids_locked() and not _ws_pool_has_slot_locked():
+                if on_demand and active_live is not None:
+                    pos = _ws_enqueue_pending_locked(active_live.pk, unique_id)
+                    logger.warning(
+                        'Pool WS plein : @%s (live #%s) en file position %s',
+                        unique_id,
+                        active_live.pk,
+                        pos,
+                    )
+                else:
+                    logger.info(
+                        'Pool WS plein (%s/%s) : scout @%s non démarré',
+                        _ws_active_count_locked(),
+                        _ws_max_connections(),
+                        unique_id,
+                    )
+                continue
+
+            _start_listener_locked(
+                unique_id,
+                live_id=active_live.pk if active_live else None,
+                scout=True,
+            )
             started += 1
             logger.info(
-                'TikTools scout démarré pour @%s (vendeur #%s, compte connecté)',
+                'TikTools scout démarré pour @%s (vendeur #%s, mode=%s, pool=%s/%s)',
                 unique_id,
                 vendeur.pk,
+                _ws_mode(),
+                _ws_active_count_locked(),
+                _ws_max_connections(),
             )
             print(
-                f'\n[TIKTOOL] Scout démarré pour @{unique_id} (vendeur #{vendeur.pk})\n',
+                f'\n[TIKTOOL] Scout démarré pour @{unique_id} '
+                f'(vendeur #{vendeur.pk}, mode={_ws_mode()}, '
+                f'pool={_ws_active_count_locked()}/{_ws_max_connections()})\n',
                 flush=True,
             )
     return started
@@ -1429,9 +1817,9 @@ _last_end_reconcile_at: datetime | None = None
 def reconcile_ended_tiktok_lives(*, min_interval_seconds: float = 60.0) -> int:
     """Filet : clôture un live AZLive encore en_cours si TikTok est offline.
 
-    Utilisé quand `streamEnd` n'arrive pas. Combine live_status + room_id :
-    - True sur l'un des deux → on laisse tourner
-    - False (et pas de True) → clôture
+    Utilisé quand `streamEnd` n'arrive pas.
+    Ne se fie JAMAIS à `live_status=False` seul (cache ~90s → fausses clôtures).
+    Clôture uniquement si POST room_id renvoie alive=False frais.
     """
     global _last_end_reconcile_at
 
@@ -1469,29 +1857,17 @@ def reconcile_ended_tiktok_lives(*, min_interval_seconds: float = 60.0) -> int:
             continue
         seen_vendeurs.add(live.vendeur_id)
 
-        # 1) live_status (rapide)
-        status_hint, _room = _check_live_via_live_status(unique_id)
-        if status_hint is True:
-            continue
-        if _tiktool_is_rate_limited():
-            break
-
-        # 2) room_id (confirmation)
-        room_hint, _fresh = _check_live_via_room_id(unique_id)
-        if room_hint is True:
-            continue
-
-        # Offline si l'un des deux dit False, et aucun ne dit True.
-        if status_hint is False or room_hint is False:
+        offline = confirm_streamer_is_offline(unique_id)
+        if offline is True:
             n = cloturer_tiktok_lives_for_streamer(unique_id, reason='tiktok_offline_reconcile')
             closed += n
             logger.info(
-                'Reconcile TikTok @%s : offline (status=%s room=%s) → %s live(s) clôturé(s)',
+                'Reconcile TikTok @%s : room_id offline confirmé → %s live(s) clôturé(s)',
                 unique_id,
-                status_hint,
-                room_hint,
                 n,
             )
+        elif offline is False:
+            logger.debug('Reconcile TikTok @%s : encore alive — on garde', unique_id)
         if _tiktool_is_rate_limited():
             break
     return closed
@@ -1508,7 +1884,7 @@ def sync_external_tiktok_lives(
 
     Ordre (économise le quota sandbox) :
     1. Démarrer/maintenir les scouts WebSocket
-    2. Attendre un signal `roomInfo` / chat (0 REST)
+    2. Attendre un signal fort (chat/gift) ou roomInfo confirmé REST
     3. Sinon 1× POST `/webcast/room_id` si `rest=True`
     """
     global _last_tiktok_sync_at
@@ -1626,15 +2002,20 @@ def sync_external_tiktok_lives(
 
 
 def recover_tiktool_listeners() -> int:
-    """Relance les scouts TikTok + listeners des lives encore en cours après redémarrage Django.
+    """Relance détection TikTok + WS des lives encore en cours.
 
-    Si le quota WebSocket (4429) est atteint : bascule sur la détection REST
-    (`live_status` / `room_id`) pour que les lives TikTok restent détectables
-    pendant la pause WS — c'était la cause du « ne détecte plus depuis hier ».
+    Mode on_demand (défaut) :
+      1) REST pour détecter un live
+      2) WS uniquement pour les lives EN_COURS (capture JP)
+
+    Mode always : scouts permanents + listeners.
+
+    Si quota WS (4429) : REST seulement, aucune nouvelle connexion WS.
     """
     restarted = 0
+    ws_paused = _tiktool_ws_is_rate_limited()
 
-    if _tiktool_ws_is_rate_limited():
+    if ws_paused:
         remaining = tiktool_ws_rate_limit_remaining_seconds()
         logger.warning(
             'TikTools WS en pause (reste ~%.0fs) — détection via REST (pas de nouvelle connexion WS)',
@@ -1645,22 +2026,51 @@ def recover_tiktool_listeners() -> int:
             f'Détection live via REST en attendant…\n',
             flush=True,
         )
+
+    # Toujours tenter la détection REST (surtout en on_demand / pause WS).
+    if ws_paused or _ws_on_demand():
         try:
             result = sync_external_tiktok_lives(
                 rest=True,
                 wait_ws_seconds=0,
-                min_interval_seconds=90.0,
+                min_interval_seconds=120.0,
             )
             restarted += int(result.get('started') or 0)
             if result.get('started'):
                 logger.info(
-                    'REST fallback TikTok : %s live(s) démarré(s) pendant pause WS',
+                    'REST TikTok : %s live(s) démarré(s) (mode=%s, ws_paused=%s)',
                     result.get('started'),
+                    _ws_mode(),
+                    ws_paused,
                 )
         except Exception:
-            logger.exception('REST fallback TikTok a échoué pendant pause WS')
+            logger.exception('REST sync TikTok a échoué dans recover')
+
+    if ws_paused:
         return restarted
 
+    if _ws_on_demand():
+        # WS seulement pour lives déjà EN_COURS.
+        lives = Live.objects.filter(statut=Live.STATUT_EN_COURS).select_related('vendeur')
+        for live in lives:
+            if not live.vendeur.tiktok_username:
+                continue
+            if ensure_tiktool_listener(live):
+                restarted += 1
+        # Si des slots se sont libérés, promouvoir la file.
+        with _listeners_lock:
+            restarted += _ws_promote_pending_locked()
+        status = tiktool_ws_pool_status()
+        logger.info(
+            'Pool WS status: actifs=%s/%s file=%s mode=%s',
+            status['active'],
+            status['max_connections'],
+            status['pending'],
+            status['mode'],
+        )
+        return restarted
+
+    # Mode always : scouts permanents.
     try:
         restarted += ensure_tiktok_scouts()
     except Exception:
@@ -1672,4 +2082,6 @@ def recover_tiktool_listeners() -> int:
             continue
         if ensure_tiktool_listener(live):
             restarted += 1
+    with _listeners_lock:
+        restarted += _ws_promote_pending_locked()
     return restarted

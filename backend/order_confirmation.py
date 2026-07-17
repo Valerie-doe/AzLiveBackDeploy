@@ -1607,13 +1607,121 @@ def _available_stock_for_commande(commande: Commande) -> int:
     return max(0, remaining - qty_ahead)
 
 
-def _order_is_eligible(commande: Commande) -> bool:
-    """Vrai si la commande peut être confirmée maintenant (assez de stock, à son tour).
+def _is_tiktok_queue_commande(commande: Commande) -> bool:
+    """Commande suivie par la file FIFO TikTok (pas Messenger Facebook)."""
+    client = getattr(commande, 'client', None)
+    if client is None:
+        return False
+    return bool(client.tiktok_id and not client.facebook_id and commande.live_id)
 
-    Le stock courant de la variante reflète déjà les commandes confirmées (décrémentées).
-    On ne compte donc que les JP encore en attente PLACÉS DEVANT (ordre_jp plus petit) :
-    s'ils consomment déjà tout le stock, ce client reste en liste d'attente.
+
+def _tiktok_queue_queryset(produit, variante=None):
+    return (
+        Commande.objects.select_related('client', 'produit', 'variante', 'live')
+        .filter(produit=produit, variante=variante, statut=Commande.STATUT_JP_CAPTURE)
+        .order_by('ordre_jp', 'id')
+    )
+
+
+def _tiktok_head_of_queue(produit, variante=None) -> Commande | None:
+    return _tiktok_queue_queryset(produit, variante).first()
+
+
+def _tiktok_is_head_of_queue(commande: Commande) -> bool:
+    head = _tiktok_head_of_queue(commande.produit, commande.variante)
+    return head is not None and head.pk == commande.pk
+
+
+def _tiktok_raw_stock(commande: Commande) -> int:
+    variante = commande._get_stock_variante()
+    if not variante:
+        return 10**9
+    return max(0, int(variante.stock))
+
+
+def _tiktok_queue_position(commande: Commande) -> tuple[int, int]:
+    """Retourne (position 1-based, nombre de personnes devant)."""
+    ahead = Commande.objects.filter(
+        produit=commande.produit,
+        variante=commande.variante,
+        statut=Commande.STATUT_JP_CAPTURE,
+        ordre_jp__lt=commande.ordre_jp,
+    ).count()
+    return ahead + 1, ahead
+
+
+def get_jp_turn_timeout_minutes() -> int:
+    from .models import ParametresPlateforme
+
+    minutes = int(ParametresPlateforme.get_current().jp_turn_timeout_minutes or 5)
+    return max(1, minutes)
+
+
+def ensure_tiktok_turn_started(commande: Commande) -> Commande:
+    """Marque le début du tour si la commande est en tête de file TikTok."""
+    if not _is_tiktok_queue_commande(commande):
+        return commande
+    if not _tiktok_is_head_of_queue(commande):
+        return commande
+    if commande.turn_started_at is None:
+        commande.turn_started_at = timezone.now()
+        commande.save(update_fields=['turn_started_at'])
+    return commande
+
+
+def expire_timed_out_tiktok_turns(*, produit=None, variante=None) -> list[int]:
+    """Expire les têtes de file TikTok dont le timeout est dépassé → promote auto."""
+    timeout = timedelta(minutes=get_jp_turn_timeout_minutes())
+    now = timezone.now()
+    expired_ids: list[int] = []
+
+    qs = Commande.objects.filter(
+        statut=Commande.STATUT_JP_CAPTURE,
+        turn_started_at__isnull=False,
+        client__tiktok_id__isnull=False,
+    ).filter(
+        models.Q(client__facebook_id__isnull=True) | models.Q(client__facebook_id='')
+    ).select_related('client', 'produit', 'variante')
+
+    if produit is not None:
+        qs = qs.filter(produit=produit)
+    if variante is not None:
+        qs = qs.filter(variante=variante)
+
+    # Une seule tête par (produit, variante) : on traite les turn_started les plus anciens.
+    seen_keys: set[tuple[int, int | None]] = set()
+    for commande in qs.order_by('turn_started_at'):
+        if not _is_tiktok_queue_commande(commande):
+            continue
+        key = (commande.produit_id, commande.variante_id)
+        if key in seen_keys:
+            continue
+        if not _tiktok_is_head_of_queue(commande):
+            continue
+        seen_keys.add(key)
+        if commande.turn_started_at and commande.turn_started_at + timeout <= now:
+            result = expire_commande(commande)
+            if result:
+                expired_ids.append(commande.id)
+                logger.info(
+                    'Timeout tour TikTok commande #%s (timeout=%s min) → suivante promu',
+                    commande.id,
+                    get_jp_turn_timeout_minutes(),
+                )
+    return expired_ids
+
+
+def _order_is_eligible(commande: Commande) -> bool:
+    """Vrai si la commande peut être confirmée maintenant.
+
+    - TikTok (file FIFO) : uniquement la tête de file + stock brut suffisant.
+    - Facebook / autres : logique historique (soft stock après les JP devant).
     """
+    if _is_tiktok_queue_commande(commande):
+        if not _tiktok_is_head_of_queue(commande):
+            return False
+        return _tiktok_raw_stock(commande) >= commande.quantite_effective
+
     return _available_stock_for_commande(commande) >= commande.quantite_effective
 
 
@@ -2435,6 +2543,8 @@ def promote_queue(produit, variante=None, exclude_pk=None) -> None:
 
     Si le stock restant est > 0 mais insuffisant pour la quantité demandée, on propose
     de prendre le reste (le client répond oui / miandry) et on s'arrête.
+
+    TikTok : pas d'auto-confirm — ouvre le tour (turn_started_at) et notifie de rouvrir le lien.
     """
     while True:
         queryset = (
@@ -2447,6 +2557,14 @@ def promote_queue(produit, variante=None, exclude_pk=None) -> None:
 
         commande = queryset.first()
         if commande is None:
+            return
+
+        # TikTok FIFO : ouvrir le tour du suivant, notifier, ne pas auto-confirmer.
+        if _is_tiktok_queue_commande(commande):
+            ensure_tiktok_turn_started(commande)
+            from .order_messaging import send_public_form_spot_available_message
+
+            send_public_form_spot_available_message(commande)
             return
 
         available = _available_stock_for_commande(commande)
@@ -2466,15 +2584,6 @@ def promote_queue(produit, variante=None, exclude_pk=None) -> None:
             from .order_messaging import send_stock_partial_offer_message
 
             send_stock_partial_offer_message(commande, available)
-            return
-
-        # TikTok (formulaire public) : ne pas auto-confirmer.
-        # Le client rouvre /commander/<live> et clique sur Confirmer.
-        client = commande.client
-        if client.tiktok_id and not client.facebook_id and commande.live_id:
-            from .order_messaging import send_public_form_spot_available_message
-
-            send_public_form_spot_available_message(commande)
             return
 
         # Messenger / autres canaux : confirmation automatique si infos déjà complètes.

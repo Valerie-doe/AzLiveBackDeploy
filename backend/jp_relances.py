@@ -37,6 +37,14 @@ def process_jp_relances(*, force: bool = False) -> dict[str, Any]:
     relances: list[dict[str, Any]] = []
     expirations: list[int] = []
 
+    # TikTok FIFO : expire d'abord les tours dont le timeout est dépassé.
+    try:
+        from backend.order_confirmation import expire_timed_out_tiktok_turns
+
+        expirations.extend(expire_timed_out_tiktok_turns())
+    except Exception:  # noqa: BLE001
+        logger.exception('Expiration timeout tours TikTok indisponible')
+
     commandes = (
         Commande.objects.filter(statut=Commande.STATUT_JP_CAPTURE)
         .select_related('client', 'produit', 'variante')
@@ -46,6 +54,12 @@ def process_jp_relances(*, force: bool = False) -> dict[str, Any]:
         # Une expiration précédente dans cette même passe a pu confirmer/avancer la file.
         commande.refresh_from_db()
         if commande.statut != Commande.STATUT_JP_CAPTURE:
+            continue
+
+        # TikTok : pas de relance Messenger (DM impossible) — le timeout gère l'expiration.
+        from backend.order_confirmation import _is_tiktok_queue_commande
+
+        if _is_tiktok_queue_commande(commande):
             continue
 
         # Seuls les clients ÉLIGIBLES (en tête, avec du stock) sont relancés.

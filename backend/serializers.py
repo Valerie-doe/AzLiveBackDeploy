@@ -481,3 +481,22 @@ class MessageSerializer(serializers.ModelSerializer):
     class Meta:
         model = Message
         fields = ['id', 'commande_id', 'contenu', 'date_envoi', 'numero_relance']
+
+
+class ParametresPlateformeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ParametresPlateforme
+        fields = [
+            'nom_plateforme',
+            'taux_commission',
+            'jp_turn_timeout_minutes',
+            'updated_at',
+        ]
+        read_only_fields = ['updated_at']
+
+    def validate_jp_turn_timeout_minutes(self, value):
+        if value is None or int(value) < 1:
+            raise serializers.ValidationError('Le timeout doit être d\'au moins 1 minute.')
+        if int(value) > 120:
+            raise serializers.ValidationError('Le timeout ne peut pas dépasser 120 minutes.')
+        return int(value)

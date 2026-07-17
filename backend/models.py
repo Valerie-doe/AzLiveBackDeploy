@@ -52,6 +52,12 @@ class ParametresPlateforme(models.Model):
         help_text="Taux de commission prélevé par la plateforme (ex: 0.10 = 10%)"
     )
     nom_plateforme = models.CharField(max_length=100, default='AZLive')
+    # Délai max pour confirmer quand c'est le tour du client (file JP TikTok).
+    jp_turn_timeout_minutes = models.PositiveIntegerField(
+        default=5,
+        help_text="Timeout (minutes) pour confirmer une commande TikTok quand c'est son tour. "
+                  "Passé ce délai, le JP expire et le suivant passe.",
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -235,6 +241,8 @@ class Commande(models.Model):
     quantite = models.PositiveIntegerField(null=True, blank=True, default=None)
     statut = models.CharField(max_length=50, choices=STATUT_CHOICES, default=STATUT_JP_CAPTURE)
     date_creation = models.DateTimeField(auto_now_add=True)
+    # Début du tour (tête de file TikTok) — sert au timeout de confirmation.
+    turn_started_at = models.DateTimeField(null=True, blank=True)
     live = models.ForeignKey(Live, on_delete=models.SET_NULL, null=True, blank=True, related_name='commandes')
     variante = models.ForeignKey(Variante, on_delete=models.SET_NULL, null=True, blank=True, related_name='commandes')
 

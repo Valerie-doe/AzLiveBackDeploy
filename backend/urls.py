@@ -34,6 +34,7 @@ from .views import (
     SocialConnectAPIView,
     SocialDisconnectAPIView,
     FacebookPagesAPIView,
+    ParametresPlateformeAPIView,
 )
 from .auth_views import (
     AuthMeAPIView,
@@ -137,5 +138,8 @@ urlpatterns = [
 
     # Dashboard
     path('dashboard/stats/', DashboardStatsAPIView.as_view(), name='dashboard-stats'),
+
+    # Paramètres plateforme
+    path('parametres/', ParametresPlateformeAPIView.as_view(), name='parametres-plateforme'),
 ]
 

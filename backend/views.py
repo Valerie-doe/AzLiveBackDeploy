@@ -32,6 +32,7 @@ from .serializers import (
     LiveCodeJPSerializer,
     VarianteSerializer,
     PageFacebookSerializer,
+    ParametresPlateformeSerializer,
 )
 from .services import MessagingService, AZExpressService
 from .facebook_oauth import FacebookOAuthError, facebook_configured, sync_vendeur_pages
@@ -1119,3 +1120,20 @@ class FacebookPagesAPIView(APIView):
 
         serializer = PageFacebookSerializer(pages, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class ParametresPlateformeAPIView(APIView):
+    """Paramètres globaux (timeout file JP TikTok, commission…)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        params = ParametresPlateforme.get_current()
+        return Response(ParametresPlateformeSerializer(params).data)
+
+    def patch(self, request):
+        params = ParametresPlateforme.get_current()
+        serializer = ParametresPlateformeSerializer(params, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)

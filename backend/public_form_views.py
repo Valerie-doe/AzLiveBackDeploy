@@ -5,6 +5,12 @@ un lien public par live. Le client s'identifie automatiquement via TikTok Login 
 l'app récupère son @ et retrouve ses commandes JP capturées pendant le live, ou lui
 indique de commander d'abord dans les commentaires du live.
 
+File FIFO TikTok :
+  - Seule la tête de file (par variante) accède au formulaire.
+  - Les autres voient leur position.
+  - Timeout configurable → expiration → promote automatique.
+  - Stock consommé uniquement à la confirmation ; qty > stock → propose le reste.
+
 Endpoints (AllowAny) :
   GET  /api/public/lives/<live_id>/tiktok-login/     → URL OAuth TikTok (client)
   GET  /api/public/tiktok/callback/                   → callback OAuth → redirect frontend
@@ -12,6 +18,7 @@ Endpoints (AllowAny) :
   POST /api/public/lives/<live_id>/order-form/
 """
 import urllib.parse
+from datetime import timedelta
 
 from django.conf import settings
 from django.db import models
@@ -28,8 +35,14 @@ from .order_confirmation import (
     OrderConfirmationError,
     cancel_commande_public,
     confirm_commande_from_message,
+    ensure_tiktok_turn_started,
+    expire_timed_out_tiktok_turns,
+    get_jp_turn_timeout_minutes,
+    _is_tiktok_queue_commande,
     _missing_confirmation_fields,
-    _stock_remaining_for,
+    _tiktok_is_head_of_queue,
+    _tiktok_queue_position,
+    _tiktok_raw_stock,
 )
 from .tiktok_oauth import (
     TikTokOAuthError,
@@ -68,34 +81,28 @@ def _pending_commandes(live: Live, clients):
     )
 
 
-def _commande_is_eligible(commande: Commande) -> bool:
-    """Assez de stock après les JP devant (même live) pour confirmer maintenant."""
-    remaining = _stock_remaining_for(commande)
-    if remaining is None:
-        return True
-    return remaining >= commande.quantite_effective
-
-
-def _infos_completes(commande: Commande) -> bool:
-    return not _missing_confirmation_fields(commande)
-
-
-def _is_waitlisted_complete(commande: Commande) -> bool:
-    """Infos déjà remplies + pas encore éligible → vraie liste d'attente (ne pas re-afficher le formulaire)."""
-    return _infos_completes(commande) and not _commande_is_eligible(commande)
+def _tour_expires_at(commande: Commande):
+    if not commande.turn_started_at:
+        return None
+    return commande.turn_started_at + timedelta(minutes=get_jp_turn_timeout_minutes())
 
 
 def _serialize_commandes(live: Live, commandes) -> list[dict]:
     variante_ids = [c.variante_id for c in commandes if c.variante_id]
     code_map = _live_code_map(live, variante_ids)
+    timeout = get_jp_turn_timeout_minutes()
     items = []
     for commande in commandes:
         variante = commande.variante
         code = code_map.get(commande.variante_id) or (variante.code_jp if variante else '')
-        remaining = _stock_remaining_for(commande)
-        stock_actuel = variante.stock if variante else None
-        eligible = _commande_is_eligible(commande)
-        infos_ok = _infos_completes(commande)
+        is_turn = _tiktok_is_head_of_queue(commande) if _is_tiktok_queue_commande(commande) else False
+        if is_turn:
+            ensure_tiktok_turn_started(commande)
+            commande.refresh_from_db(fields=['turn_started_at'])
+        position, ahead = _tiktok_queue_position(commande)
+        raw_stock = _tiktok_raw_stock(commande)
+        infos_ok = not _missing_confirmation_fields(commande)
+        expires = _tour_expires_at(commande) if is_turn else None
         items.append(
             {
                 'commande_id': commande.id,
@@ -105,27 +112,36 @@ def _serialize_commandes(live: Live, commandes) -> list[dict]:
                 'couleur': variante.couleur if variante else '',
                 'prix_unitaire': str(variante.prix_unitaire) if variante else None,
                 'quantite': commande.quantite,
-                'stock_disponible': remaining,
-                'stock_actuel': stock_actuel,
-                'en_rupture': remaining is not None and remaining <= 0,
-                'en_liste_attente': not eligible,
+                'stock_disponible': raw_stock if is_turn else None,
+                'stock_actuel': variante.stock if variante else None,
+                'en_rupture': is_turn and raw_stock <= 0,
+                'en_liste_attente': not is_turn,
+                'a_son_tour': is_turn,
+                'position_file': position,
+                'personnes_devant': ahead,
+                'ordre_jp': commande.ordre_jp,
                 'infos_completes': infos_ok,
-                'pret_a_confirmer': eligible and infos_ok,
+                'pret_a_confirmer': is_turn and infos_ok and raw_stock > 0,
+                'timeout_minutes': timeout,
+                'tour_started_at': (
+                    commande.turn_started_at.isoformat() if commande.turn_started_at and is_turn else None
+                ),
+                'tour_expires_at': expires.isoformat() if expires else None,
             }
         )
     return items
 
 
 def _split_pending_commandes(live: Live, clients):
-    """Sépare les JP confirmables / à compléter des JP déjà en liste d'attente."""
+    """Sépare : à son tour (formulaire) vs en file (position seulement)."""
     pending = list(_pending_commandes(live, clients))
     a_traiter = []
     en_attente = []
     for commande in pending:
-        if _is_waitlisted_complete(commande):
-            en_attente.append(commande)
-        else:
+        if _is_tiktok_queue_commande(commande) and _tiktok_is_head_of_queue(commande):
             a_traiter.append(commande)
+        else:
+            en_attente.append(commande)
     return a_traiter, en_attente
 
 
@@ -138,9 +154,13 @@ class PublicOrderFormAPIView(APIView):
         live = get_object_or_404(Live, pk=live_id)
         handle = request.query_params.get('handle', '')
 
+        # Expire les tours TikTok dépassés avant de répondre (promote auto).
+        expire_timed_out_tiktok_turns()
+
         base = {
             'live': {'id': live.id, 'titre': live.titre, 'statut': live.statut},
             'vendeur': live.vendeur.nom if live.vendeur_id else '',
+            'jp_turn_timeout_minutes': get_jp_turn_timeout_minutes(),
         }
 
         if not handle.strip():
@@ -187,9 +207,7 @@ class PublicOrderFormAPIView(APIView):
                         else ''
                     ),
                 },
-                # Uniquement les JP à compléter / à confirmer (stock disponible).
                 'commandes': _serialize_commandes(live, commandes_a_traiter),
-                # Déjà en file d'attente (infos OK, stock pas encore libre) — ne pas re-afficher le formulaire.
                 'commandes_liste_attente': _serialize_commandes(live, commandes_attente),
             },
             status=status.HTTP_200_OK,
@@ -199,6 +217,8 @@ class PublicOrderFormAPIView(APIView):
         live = get_object_or_404(Live, pk=live_id)
         data = request.data or {}
 
+        expire_timed_out_tiktok_turns()
+
         handle = (data.get('handle') or '').strip()
         clients = _match_clients(handle)
         if not handle or not clients.exists():
@@ -207,7 +227,6 @@ class PublicOrderFormAPIView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Validation des champs client obligatoires.
         missing = [f for f in REQUIRED_CLIENT_FIELDS if not str(data.get(f, '')).strip()]
         if missing:
             return Response(
@@ -222,12 +241,11 @@ class PublicOrderFormAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Commandes éligibles du client pour ce live (anti-falsification d'ID).
-        # On exclut les JP déjà en liste d'attente (infos OK + pas encore de place).
+        # Uniquement les JP à son tour (tête de file).
         allowed = {
             c.id: c
             for c in _pending_commandes(live, clients)
-            if not _is_waitlisted_complete(c)
+            if _is_tiktok_queue_commande(c) and _tiktok_is_head_of_queue(c)
         }
 
         parsed_data = {
@@ -237,6 +255,7 @@ class PublicOrderFormAPIView(APIView):
             'date_livraison': str(data.get('date_livraison')).strip(),
             'heure_livraison': str(data.get('heure_livraison')).strip(),
         }
+        accept_partial = bool(data.get('accept_partial'))
 
         results = []
         errors = []
@@ -250,17 +269,53 @@ class PublicOrderFormAPIView(APIView):
 
             commande = allowed.get(commande_id)
             if commande is None:
-                errors.append({'commande_id': commande_id, 'detail': 'Commande introuvable pour ce compte/live.'})
+                errors.append(
+                    {
+                        'commande_id': commande_id,
+                        'detail': "Ce n'est pas encore votre tour, ou commande introuvable.",
+                        'pas_encore_tour': True,
+                    }
+                )
                 continue
             if quantite <= 0:
                 errors.append({'commande_id': commande_id, 'detail': 'La quantité doit être supérieure à 0.'})
                 continue
 
+            if commande.variante_id:
+                commande.variante.refresh_from_db()
+            stock = _tiktok_raw_stock(commande)
+
+            if stock <= 0:
+                errors.append(
+                    {
+                        'commande_id': commande_id,
+                        'detail': 'Stock épuisé pour ce produit.',
+                        'rupture_stock': True,
+                    }
+                )
+                continue
+
+            if quantite > stock:
+                if accept_partial or bool(item.get('accept_partial')):
+                    quantite = stock
+                else:
+                    errors.append(
+                        {
+                            'commande_id': commande_id,
+                            'detail': (
+                                f'Stock insuffisant : il reste {stock}. '
+                                f'Acceptez-vous de prendre {stock} ?'
+                            ),
+                            'stock_propose': stock,
+                            'quantite_demandee': quantite,
+                            'rupture_stock': False,
+                        }
+                    )
+                    continue
+
             commande.quantite = quantite
             commande.save(update_fields=['quantite'])
 
-            # Recharge la variante pour voir le stock à jour (après une confirmation précédente
-            # dans la même requête multi-commandes).
             if commande.variante_id:
                 commande.variante.refresh_from_db()
 
@@ -271,13 +326,13 @@ class PublicOrderFormAPIView(APIView):
                     inbound_text='Informations transmises via le formulaire de commande (TikTok).',
                     canal='TikTok',
                 )
-                # Liste d'attente = infos OK, pas encore de stock → succès partiel, pas une erreur.
                 results.append(
                     {
                         'commande_id': commande_id,
                         'status': outcome.get('status'),
                         'complet': bool(outcome.get('complet')),
                         'en_attente': bool(outcome.get('en_attente')),
+                        'quantite_confirmee': quantite,
                     }
                 )
             except OrderConfirmationError as exc:
