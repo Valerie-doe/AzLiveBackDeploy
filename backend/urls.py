@@ -48,7 +48,13 @@ from .auth_views import (
     TikTokTokenLoginAPIView,
 )
 from .webhooks import FacebookWebhookView, TikTokWebhookView
-from .live_views import LiveDemarrerAPIView, LiveArreterAPIView
+from .live_views import (
+    LiveDemarrerAPIView,
+    LiveArreterAPIView,
+    LiveCaptureJpStatusAPIView,
+    LiveCaptureJpStartAPIView,
+    LiveCaptureJpStopAPIView,
+)
 from .media_views import MediaMTXAuthAPIView, MediaMTXWhipProxyAPIView
 from .public_form_views import (
     PublicOrderCancelAPIView,
@@ -93,6 +99,21 @@ urlpatterns = [
     path('lives/<int:pk>/codes/', LiveCodesAPIView.as_view(), name='live-codes'),
     path('lives/<int:pk>/demarrer/', LiveDemarrerAPIView.as_view(), name='live-demarrer'),
     path('lives/<int:pk>/arreter/', LiveArreterAPIView.as_view(), name='live-arreter'),
+    path(
+        'lives/<int:pk>/capture-jp/',
+        LiveCaptureJpStatusAPIView.as_view(),
+        name='live-capture-jp-status',
+    ),
+    path(
+        'lives/<int:pk>/capture-jp/start/',
+        LiveCaptureJpStartAPIView.as_view(),
+        name='live-capture-jp-start',
+    ),
+    path(
+        'lives/<int:pk>/capture-jp/stop/',
+        LiveCaptureJpStopAPIView.as_view(),
+        name='live-capture-jp-stop',
+    ),
 
     # Collaborateurs
     path('collaborateurs/', CollaborateurListCreateView.as_view(), name='collaborateur-list-create'),

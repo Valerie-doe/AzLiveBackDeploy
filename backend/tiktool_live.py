@@ -120,6 +120,11 @@ def _ws_on_demand() -> bool:
     return _ws_mode() == 'on_demand'
 
 
+def _ws_manual_capture() -> bool:
+    """Si True : pas d'ouverture WS auto — uniquement via « Activer capture JP »."""
+    return bool(getattr(settings, 'TIKTOOL_WS_MANUAL_CAPTURE', True))
+
+
 def _ws_max_connections() -> int:
     """Plafond de WebSockets TikTools ouverts en parallèle (pool)."""
     try:
@@ -1574,6 +1579,13 @@ def ensure_tiktok_scouts(*, vendeur_id: int | None = None) -> int:
         return 0
 
     on_demand = _ws_on_demand()
+    if on_demand and _ws_manual_capture():
+        logger.info(
+            'TikTools WS manual_capture : ensure_tiktok_scouts ne démarre rien '
+            '(attendre le bouton « Activer capture JP »)'
+        )
+        return 0
+
     if on_demand:
         logger.info(
             'TikTools WS mode=on_demand : scouts seulement pour lives EN_COURS '
@@ -1655,9 +1667,19 @@ def listener_status(live_id: int) -> dict[str, Any]:
         }
 
 
-def ensure_tiktool_listener(live: Live) -> bool:
-    """Démarre/re-démarre le listener TikTok pour un live en cours."""
+def ensure_tiktool_listener(live: Live, *, force: bool = False) -> bool:
+    """Démarre/re-démarre le listener TikTok pour un live en cours.
+
+    - force=False (chemins auto sync/recover) : ignoré si TIKTOOL_WS_MANUAL_CAPTURE
+    - force=True  : bouton vendeur « Activer capture JP »
+    """
     if live.statut != Live.STATUT_EN_COURS or live.vendeur.is_demo_mode:
+        return False
+    if _ws_manual_capture() and not force:
+        logger.debug(
+            'ensure_tiktool_listener live #%s ignoré (manual capture — attendre le bouton vendeur)',
+            live.pk,
+        )
         return False
     status = listener_status(live.pk)
     if status.get('running'):
@@ -1680,6 +1702,121 @@ def ensure_tiktool_listener(live: Live) -> bool:
                 live.pk,
             )
     return started
+
+
+def capture_jp_status_for_live(live: Live) -> dict[str, Any]:
+    """État capture JP (WS) pour un live — UI vendeur."""
+    pool = tiktool_ws_pool_status()
+    ls = listener_status(live.pk)
+    pending_pos = None
+    with _listeners_lock:
+        for idx, (lid, _) in enumerate(_ws_pending):
+            if lid == live.pk:
+                pending_pos = idx + 1
+                break
+    return {
+        'live_id': live.pk,
+        'capture_active': bool(ls.get('running')),
+        'unique_id': ls.get('unique_id') or (
+            normalize_tiktok_username(live.vendeur.tiktok_username or '')
+            if live.vendeur_id
+            else ''
+        ),
+        'manual_capture': _ws_manual_capture(),
+        'ws_mode': _ws_mode(),
+        'queued': pending_pos is not None,
+        'queue_position': pending_pos,
+        'pool': {
+            'active': pool['active'],
+            'max': pool['max_connections'],
+            'pending': pool['pending'],
+        },
+        'ws_rate_limited': pool['ws_rate_limited'],
+        'ws_rate_limit_remaining_seconds': pool['ws_rate_limit_remaining_seconds'],
+        'tiktool_configured': tiktool_configured(),
+    }
+
+
+def start_capture_jp_for_live(live: Live) -> dict[str, Any]:
+    """Action bouton vendeur : active la capture JP (ouvre un slot WS)."""
+    if live.statut != Live.STATUT_EN_COURS:
+        return {
+            'ok': False,
+            'detail': 'Le live doit être en cours pour activer la capture JP.',
+            'status': capture_jp_status_for_live(live),
+        }
+    if not live.vendeur_id or not live.vendeur.tiktok_username:
+        return {
+            'ok': False,
+            'detail': 'Aucun compte TikTok lié à ce vendeur.',
+            'status': capture_jp_status_for_live(live),
+        }
+    if not tiktool_configured():
+        return {
+            'ok': False,
+            'detail': 'TIKTOOL_API_KEY manquant sur le serveur.',
+            'status': capture_jp_status_for_live(live),
+        }
+
+    started = ensure_tiktool_listener(live, force=True)
+    status = capture_jp_status_for_live(live)
+    if started:
+        return {
+            'ok': True,
+            'detail': 'Capture JP activée — les commentaires TikTok sont écoutés.',
+            'status': status,
+        }
+    if status.get('queued'):
+        return {
+            'ok': True,
+            'detail': (
+                f"Pool WS plein ({status['pool']['active']}/{status['pool']['max']}). "
+                f"Live en file d'attente (position {status['queue_position']})."
+            ),
+            'status': status,
+        }
+    if status.get('ws_rate_limited'):
+        return {
+            'ok': False,
+            'detail': (
+                f"Quota WebSocket TikTools atteint "
+                f"(reste ~{int(status['ws_rate_limit_remaining_seconds'])}s). "
+                f"Réessaie après le reset."
+            ),
+            'status': status,
+        }
+    return {
+        'ok': False,
+        'detail': 'Impossible d\'activer la capture JP pour le moment.',
+        'status': status,
+    }
+
+
+def stop_capture_jp_for_live(live: Live) -> dict[str, Any]:
+    """Action bouton vendeur : coupe la capture JP et libère le slot pool."""
+    stopped = stop_tiktool_listener(live)
+    with _listeners_lock:
+        _ws_remove_pending_locked(live.pk)
+        _ws_promote_pending_locked()
+    if live.vendeur_id and live.vendeur.tiktok_username:
+        try:
+            _upsert_tiktok_diffusion(
+                live,
+                unique_id=normalize_tiktok_username(live.vendeur.tiktok_username),
+                username=live.vendeur.tiktok_username,
+                status='LIVE',
+                is_live=True,
+                listener='stopped',
+            )
+        except Exception:
+            logger.exception('Maj diffusion après stop capture JP live #%s', live.pk)
+    status = capture_jp_status_for_live(live)
+    return {
+        'ok': True,
+        'detail': 'Capture JP désactivée.' if stopped else 'Capture déjà inactive.',
+        'stopped': bool(stopped),
+        'status': status,
+    }
 
 
 def _facebook_still_live(live: Live) -> bool:
@@ -2050,6 +2187,19 @@ def recover_tiktool_listeners() -> int:
         return restarted
 
     if _ws_on_demand():
+        # Mode manuel : ne pas ouvrir de WS ici — le vendeur clique « Activer capture JP ».
+        if _ws_manual_capture():
+            with _listeners_lock:
+                restarted += _ws_promote_pending_locked()
+            status = tiktool_ws_pool_status()
+            logger.info(
+                'Pool WS status (manual): actifs=%s/%s file=%s',
+                status['active'],
+                status['max_connections'],
+                status['pending'],
+            )
+            return restarted
+
         # WS seulement pour lives déjà EN_COURS.
         lives = Live.objects.filter(statut=Live.STATUT_EN_COURS).select_related('vendeur')
         for live in lives:
