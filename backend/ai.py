@@ -196,9 +196,22 @@ class HybridCommentAnalyzer:
             self.REGEX_CONFIANCE if regex_result.get('produit_id') else None
         )
 
-        # Cas net traité par le regex : intention d'achat + produit reconnu.
         if regex_result.get('intent') == 'achat' and regex_result.get('produit_id'):
-            return regex_result
+            produit_id = regex_result['produit_id']
+            in_scope = True
+            if live is not None:
+                in_scope = live.produits_dressing.filter(pk=produit_id).exists()
+            elif vendeur is not None:
+                in_scope = Produit.objects.filter(pk=produit_id, vendeur=vendeur).exists()
+            if in_scope:
+                return regex_result
+            # Faux positif hors live/vendeur : on continue (LLM ou résultat sans produit).
+            regex_result['produit_trouve'] = None
+            regex_result['produit_id'] = None
+            regex_result['variante_id'] = None
+            # Garde product_query / raw pour resolve_live_variante (code live « 1 »).
+            regex_result['code_jp'] = None
+            regex_result['confiance'] = None
 
         # Repli LLM (uniquement si configuré) pour le langage libre / malgache.
         if self.llm.is_enabled():
