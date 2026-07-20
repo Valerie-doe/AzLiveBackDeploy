@@ -2572,8 +2572,10 @@ def _finalize_confirmation(
     promote_next=True : après confirmation, avance la file (désactivé dans promote_queue).
     """
     with transaction.atomic():
+        # of=('self',) : Postgres refuse FOR UPDATE sur le côté nullable d'un OUTER JOIN
+        # (variante / live sont null=True → select_related génère LEFT OUTER JOIN).
         locked = (
-            Commande.objects.select_for_update()
+            Commande.objects.select_for_update(of=('self',))
             .select_related('client', 'produit', 'variante', 'live')
             .get(pk=commande.pk)
         )
