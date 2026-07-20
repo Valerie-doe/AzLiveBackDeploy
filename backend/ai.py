@@ -285,12 +285,16 @@ class ConfirmationMessageAnalyzer:
             client
             and parsed.get('nom')
             and parsed.get('telephone')
-            and not parsed.get('adresse')
             and not self._needs_nom(client)
             and parsed.get('nom') != client.nom
         ):
-            parsed = {**parsed, 'adresse': parsed['nom']}
-            parsed.pop('nom', None)
+            if not parsed.get('adresse'):
+                # Une seule ligne texte alors que le nom est déjà connu → c'est l'adresse.
+                parsed = {**parsed, 'adresse': parsed['nom']}
+                parsed.pop('nom', None)
+            elif parsed.get('nom') == parsed.get('adresse'):
+                # Doublon (ex. « Ampefiloha » pris pour nom et adresse) : garder l'adresse.
+                parsed.pop('nom', None)
 
         return {
             'raw_text': text,

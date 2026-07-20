@@ -1,10 +1,8 @@
 import re
 from datetime import timedelta
 
-import threading
-
 from django.db import models, transaction
-from django.db.models import Max, Sum, Count, Value, F, Q, DecimalField, ExpressionWrapper
+from django.db.models import Max, Sum, Count, Value
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -32,7 +30,6 @@ from .serializers import (
     LiveCodeJPSerializer,
     VarianteSerializer,
     PageFacebookSerializer,
-    ParametresPlateformeSerializer,
 )
 from .services import MessagingService, AZExpressService
 from .facebook_oauth import FacebookOAuthError, facebook_configured, sync_vendeur_pages
@@ -532,9 +529,16 @@ class CommandeConfirmerAPIView(APIView):
             except OrderConfirmationError as exc:
                 return Response({'detail': exc.message, **exc.payload}, status=exc.status_code)
 
+        from .order_confirmation import _analyzer_client_for_commande
+
+        analyzer_client = (
+            _analyzer_client_for_commande(commande)
+            if commande.statut == Commande.STATUT_JP_CAPTURE
+            else commande.client
+        )
         parsed = analyze_confirmation_message(
             request.data.get('message_text', ''),
-            client=commande.client,
+            client=analyzer_client,
         )
         if not parsed:
             parsed = {
@@ -610,11 +614,7 @@ class CommandeLancerLivraisonAPIView(APIView):
 class DashboardStatsAPIView(APIView):
     def get(self, request):
         vendeur_id = request.query_params.get('vendeur_id')
-        commandes_query = (
-            Commande.objects.select_related('produit', 'variante')
-            .prefetch_related('produit__variantes')
-            .all()
-        )
+        commandes_query = Commande.objects.select_related('produit', 'variante').all()
         lives_query = Live.objects.all()
         products_query = Produit.objects.prefetch_related('variantes').all()
 
@@ -649,14 +649,11 @@ class DashboardStatsAPIView(APIView):
                 Commande.STATUT_LIVRE
             ]
         )
-        # Une seule matérialisation de la queryset (au lieu de .count() + itération +
-        # 12 requêtes filtrées par mois) : évite 13+ requêtes SQL redondantes.
-        confirmed_orders_list = list(confirmed_orders)
-        confirmed_count = len(confirmed_orders_list)
+        confirmed_count = confirmed_orders.count()
 
         taux_confirmation = (confirmed_count / total_jps * 100) if total_jps > 0 else 0
 
-        chiffre_affaires = sum(float(cmd.get_prix_total()) for cmd in confirmed_orders_list)
+        chiffre_affaires = sum(float(cmd.get_prix_total()) for cmd in confirmed_orders)
 
         commission_rate = float(ParametresPlateforme.get_current().taux_commission)
         montant_a_reverser = float(chiffre_affaires) * (1.0 - commission_rate)
@@ -675,13 +672,14 @@ class DashboardStatsAPIView(APIView):
             1: 'Janvier', 2: 'Février', 3: 'Mars', 4: 'Avril', 5: 'Mai', 6: 'Juin',
             7: 'Juillet', 8: 'Août', 9: 'Septembre', 10: 'Octobre', 11: 'Novembre', 12: 'Décembre'
         }
-        monthly_totals = {m_num: 0.0 for m_num in months}
-        for cmd in confirmed_orders_list:
-            monthly_totals[cmd.date_creation.month] += float(cmd.get_prix_total())
-        monthly_chart_data = [
-            {'mois': m_name, 'chiffre_affaires': monthly_totals[m_num]}
-            for m_num, m_name in months.items()
-        ]
+        monthly_chart_data = []
+        for m_num, m_name in months.items():
+            month_orders = confirmed_orders.filter(date_creation__month=m_num)
+            revenue = sum(float(cmd.get_prix_total()) for cmd in month_orders)
+            monthly_chart_data.append({
+                'mois': m_name,
+                'chiffre_affaires': float(revenue)
+            })
 
         best_sellers_ranking = []
         best_sellers_query = (
@@ -723,78 +721,37 @@ class DashboardStatsAPIView(APIView):
         }, status=status.HTTP_200_OK)
 
 
-def _live_list_queryset():
-    """Queryset lives optimisé : stats en SQL, dressing = IDs seulement."""
-    confirmed = [
-        Commande.STATUT_CONFIRME,
-        Commande.STATUT_PREPARE,
-        Commande.STATUT_EN_LIVRAISON,
-        Commande.STATUT_LIVRE,
-    ]
-    money = DecimalField(max_digits=14, decimal_places=2)
-    line_total = ExpressionWrapper(
-        Coalesce(F('commandes__variante__prix_unitaire'), Value(0, output_field=money))
-        * Coalesce(F('commandes__quantite'), Value(1)),
-        output_field=money,
-    )
-    return (
-        Live.objects.select_related('vendeur', 'operateur')
-        .prefetch_related(
-            'produits_dressing',
-            models.Prefetch(
-                'codes_jp',
-                queryset=LiveCodeJP.objects.select_related('variante'),
-            ),
-        )
-        .annotate(
-            annotated_nb_fiches=Count('commandes', distinct=True),
-            annotated_ca=Coalesce(
-                Sum(line_total, filter=Q(commandes__statut__in=confirmed)),
-                Value(0, output_field=money),
-                output_field=money,
-            ),
-        )
-        .order_by('-date_live')
-    )
-
-
 class LiveListCreateView(generics.ListCreateAPIView):
     serializer_class = LiveSerializer
     permission_classes = [AllowAny]
 
     def get_queryset(self):
-        queryset = _live_list_queryset()
+        queryset = Live.objects.select_related('vendeur').all().order_by('-date_live')
         vendeur_id = self.request.query_params.get('vendeur_id')
         if vendeur_id:
             queryset = queryset.filter(vendeur_id=vendeur_id)
         return queryset
 
     def list(self, request, *args, **kwargs):
-        # ?sync=1 → démarre les scouts WebSocket EN ARRIÈRE-PLAN (ne bloque plus le GET).
+        # ?sync=1 → démarre uniquement les scouts WebSocket (0 REST = 0 quota API).
         if str(request.query_params.get('sync') or '') in {'1', 'true', 'yes'}:
             vendeur_id = request.query_params.get('vendeur_id')
-            kwargs_scouts = {}
-            if vendeur_id and str(vendeur_id).isdigit():
-                kwargs_scouts['vendeur_id'] = int(vendeur_id)
+            try:
+                from .tiktool_live import ensure_tiktok_scouts
 
-            def _start_scouts():
-                try:
-                    from .tiktool_live import ensure_tiktok_scouts
-
-                    ensure_tiktok_scouts(**kwargs_scouts)
-                except Exception:
-                    pass
-
-            threading.Thread(target=_start_scouts, name='tiktok-scouts-sync', daemon=True).start()
+                kwargs_scouts = {}
+                if vendeur_id and str(vendeur_id).isdigit():
+                    kwargs_scouts['vendeur_id'] = int(vendeur_id)
+                ensure_tiktok_scouts(**kwargs_scouts)
+            except Exception:
+                pass
         return super().list(request, *args, **kwargs)
 
 
 class LiveDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = Live.objects.all()
     serializer_class = LiveSerializer
     permission_classes = [AllowAny]
-
-    def get_queryset(self):
-        return _live_list_queryset()
 
     def perform_update(self, serializer):
         old_statut = serializer.instance.statut
@@ -805,17 +762,6 @@ class LiveDetailView(generics.RetrieveUpdateDestroyAPIView):
             elif live.statut == Live.STATUT_TERMINE:
                 live = arreter_live(live)
             serializer.instance = live
-
-    def update(self, request, *args, **kwargs):
-        # Recharge après save pour conserver annotations SQL (CA / nb_fiches)
-        # sans retomber sur des requêtes N+1 dans le serializer.
-        partial = kwargs.pop('partial', False)
-        instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
-        refreshed = self.get_queryset().get(pk=serializer.instance.pk)
-        return Response(self.get_serializer(refreshed).data)
 
 
 class LiveCodesAPIView(APIView):
@@ -1026,32 +972,7 @@ class SocialConnectAPIView(APIView):
                         defaults={'nom': p['nom'], 'statut': PageFacebook.STATUT_PRET}
                     )
         elif platform == 'tiktok':
-            from .jp_capture import normalize_tiktok_username
-
-            raw = (request.data.get('tiktok_username') or '').strip()
-            if not raw:
-                return Response(
-                    {
-                        'detail': (
-                            'Indiquez votre @TikTok (unique_id, ex. azplus.mg). '
-                            'Le nom d\'affichage (emoji) ne permet pas de détecter un live.'
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            handle = normalize_tiktok_username(raw)
-            if not re.fullmatch(r'[a-z0-9._-]+', handle):
-                return Response(
-                    {
-                        'detail': (
-                            f'@{handle} n\'est pas un @TikTok valide. '
-                            'Utilisez le handle de votre profil (lettres, chiffres, . _ -), '
-                            'pas le nom d\'affichage.'
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            vendeur.tiktok_username = f'@{handle}'
+            vendeur.tiktok_username = request.data.get('tiktok_username', '@maboutique_tiktok')
             vendeur.is_demo_mode = False
         elif platform == 'demo':
             vendeur.is_demo_mode = True
@@ -1062,13 +983,6 @@ class SocialConnectAPIView(APIView):
             return Response({'detail': 'Plateforme invalide.'}, status=status.HTTP_400_BAD_REQUEST)
 
         vendeur.save()
-        if platform == 'tiktok':
-            try:
-                from .tiktool_live import ensure_tiktok_scouts
-
-                ensure_tiktok_scouts(vendeur_id=vendeur.pk)
-            except Exception:
-                pass
         return Response(VendeurSerializer(vendeur).data, status=status.HTTP_200_OK)
 
 
@@ -1120,20 +1034,3 @@ class FacebookPagesAPIView(APIView):
 
         serializer = PageFacebookSerializer(pages, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
-
-
-class ParametresPlateformeAPIView(APIView):
-    """Paramètres globaux (timeout file JP TikTok, commission…)."""
-
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-        params = ParametresPlateforme.get_current()
-        return Response(ParametresPlateformeSerializer(params).data)
-
-    def patch(self, request):
-        params = ParametresPlateforme.get_current()
-        serializer = ParametresPlateformeSerializer(params, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(serializer.data)

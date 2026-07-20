@@ -31,8 +31,10 @@ def create_jp_commande(client, produit, live=None, canal='', comment_id=None, va
     transaction pour ne pas garder le verrou.
 
     Si le client a déjà une commande JP en attente pour la même déclinaison (même produit
-    et même variante), on réutilise cette commande au lieu d'en créer un doublon — le
-    client n'envoie pas plusieurs JP, c'est une re-publication accidentelle.
+    et même variante) *dans le même contexte* (même live, ou hors-live / article), on
+    réutilise cette commande au lieu d'en créer un doublon — le client n'envoie pas
+    plusieurs JP, c'est une re-publication accidentelle. Un JP article ne doit jamais
+    reprendre une commande live (et inversement) : les infos / codes sont distincts.
     """
     reused = False
     with transaction.atomic():
@@ -45,22 +47,27 @@ def create_jp_commande(client, produit, live=None, canal='', comment_id=None, va
                 statut=Commande.STATUT_JP_CAPTURE,
             )
         )
-        # Évite les doublons accidentels sur le *même* live uniquement : une commande JP
-        # en attente d'un live précédent ne doit pas masquer une nouvelle capture.
+        # Même contexte uniquement : live A ≠ live B ≠ article (live=None).
+        # La file d'attente (ordre_jp) est aussi isolée par live.
         if live is not None:
             existing_qs = existing_qs.filter(live=live)
+        else:
+            existing_qs = existing_qs.filter(live__isnull=True)
         existing = existing_qs.order_by('ordre_jp').first()
         if existing:
             commande = existing
             reused = True
         else:
-            # L'ordre suit le scope de la file d'attente / de l'éligibilité : (produit, variante).
-            max_order = (
+            # L'ordre suit le scope de la file : (produit, variante, live|article).
+            ordre_qs = (
                 Commande.objects.select_for_update()
                 .filter(produit=produit, variante=variante)
-                .aggregate(max_ordre=Max('ordre_jp'))['max_ordre']
-                or 0
             )
+            if live is not None:
+                ordre_qs = ordre_qs.filter(live=live)
+            else:
+                ordre_qs = ordre_qs.filter(live__isnull=True)
+            max_order = ordre_qs.aggregate(max_ordre=Max('ordre_jp'))['max_ordre'] or 0
             ordre_jp = max_order + 1
             commande = Commande.objects.create(
                 client=client,
@@ -202,6 +209,51 @@ def resolve_active_live(vendeur: Vendeur | None, page_id: str | None = None, pag
     return lives.first()
 
 
+def resolve_live_from_facebook_video(
+    *,
+    post_id: str | None,
+    page_id: str | None = None,
+    vendeur: Vendeur | None = None,
+) -> Live | None:
+    """Si ``post_id`` correspond à une live_video d'un live en cours, renvoie ce live.
+
+    Les commentaires d'un Live Facebook arrivent parfois aussi via le webhook ``feed``
+    (post_id = id vidéo ou ``{page_id}_{video_id}``). Il faut les rattacher à CE live,
+    pas les traiter comme un article (sinon le code JP « 3 » ne résout pas).
+    """
+    raw = str(post_id or '').strip()
+    if not raw:
+        return None
+
+    candidates = {raw}
+    if '_' in raw:
+        candidates.add(raw.rsplit('_', 1)[-1])
+    if page_id:
+        candidates.add(f'{page_id}_{raw}')
+
+    lives = Live.objects.filter(statut=Live.STATUT_EN_COURS).select_related('vendeur')
+    if vendeur is not None:
+        lives = lives.filter(vendeur=vendeur)
+
+    for live in lives.order_by('-date_live'):
+        broadcasts = list((live.diffusion_plateformes or {}).get('facebook') or [])
+        for broadcast in broadcasts:
+            video_id = str(broadcast.get('live_video_id') or '').strip()
+            if not video_id:
+                continue
+            broadcast_page = str(broadcast.get('page_id') or '')
+            if page_id and broadcast_page and broadcast_page != str(page_id):
+                continue
+            if (
+                video_id in candidates
+                or raw == video_id
+                or raw.endswith(f'_{video_id}')
+                or video_id in raw
+            ):
+                return live
+    return None
+
+
 def find_produit_for_comment(analysis, vendeur=None, live=None):
     produit_id = analysis.get('produit_id')
     queryset = Produit.objects.all()
@@ -253,7 +305,15 @@ def process_social_comment(
     live=None,
     id_field: str = 'facebook_id',
     comment_id: str | None = None,
+    bind_active_live: bool = True,
 ):
+    """Traite un commentaire social (JP / auto-réponse / assistance).
+
+    ``bind_active_live`` (défaut True) : si aucun ``live`` n'est fourni, rattache le
+    live en cours du vendeur (commentaires live TikTok / poller Facebook live).
+    Pour un commentaire sur un *article* (webhook ``feed``), passer False : le catalogue
+    et la commande ne doivent pas hériter du live actif ni de ses anciennes infos.
+    """
     if not sender_id or not comment_text:
         raise JPCaptureError(
             'Les champs identifiant expéditeur et comment_text sont obligatoires.',
@@ -266,7 +326,7 @@ def process_social_comment(
     if vendeur is None and channel == 'TikTok' and streamer_unique_id:
         vendeur = resolve_vendeur_from_tiktok_username(streamer_unique_id)
 
-    if live is None:
+    if live is None and bind_active_live:
         page = PageFacebook.objects.filter(page_id=str(page_id)).first() if page_id else None
         live = resolve_active_live(vendeur, page_id=page_id, page_name=page.nom if page else None)
 

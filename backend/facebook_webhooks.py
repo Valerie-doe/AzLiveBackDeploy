@@ -6,7 +6,12 @@ from typing import Any
 from django.conf import settings
 
 from .facebook_oauth import FacebookOAuthError, _graph_request
-from .jp_capture import JPCaptureError, process_social_comment
+from .jp_capture import (
+    JPCaptureError,
+    process_social_comment,
+    resolve_live_from_facebook_video,
+    resolve_vendeur_from_page,
+)
 from .order_confirmation import OrderConfirmationError, process_inbound_private_message
 
 
@@ -93,6 +98,7 @@ def is_legacy_facebook_payload(payload: dict[str, Any]) -> bool:
 
 def process_facebook_webhook_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if is_legacy_facebook_payload(payload):
+        # Legacy / tests : pas de rattachement auto au live (comme un article).
         result = process_social_comment(
             sender_id=str(payload['sender_facebook_id']),
             sender_name=payload.get('sender_name', 'Client Facebook'),
@@ -100,6 +106,7 @@ def process_facebook_webhook_payload(payload: dict[str, Any]) -> dict[str, Any]:
             channel='Facebook',
             page_id=payload.get('page_id'),
             id_field='facebook_id',
+            bind_active_live=False,
         )
         status_code = 201 if result.get('status') != 'ignored' else 200
         return {'status_code': status_code, 'results': [result]}
@@ -136,14 +143,26 @@ def process_facebook_webhook_payload(payload: dict[str, Any]) -> dict[str, Any]:
             results.append({'status': 'ignored', 'detail': 'Commentaire vide.', 'comment_id': comment.get('comment_id')})
             continue
         try:
+            page_id = comment.get('page_id')
+            vendeur = resolve_vendeur_from_page(page_id)
+            # Commentaire sur la vidéo d'un live en cours → rattacher à CE live.
+            # Sinon (vrai article / post) → hors live, pas de croisement.
+            live = resolve_live_from_facebook_video(
+                post_id=comment.get('post_id'),
+                page_id=page_id,
+                vendeur=vendeur,
+            )
             result = process_social_comment(
                 sender_id=comment['sender_facebook_id'],
                 sender_name=comment['sender_name'],
                 comment_text=comment['comment_text'],
                 channel='Facebook',
-                page_id=comment.get('page_id'),
+                page_id=page_id,
+                vendeur=vendeur,
+                live=live,
                 id_field='facebook_id',
                 comment_id=comment.get('comment_id'),
+                bind_active_live=False,
             )
             results.append({**result, 'comment_id': comment.get('comment_id')})
         except JPCaptureError as exc:
