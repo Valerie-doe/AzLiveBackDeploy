@@ -167,48 +167,8 @@ def _deliver_private_message(
 
 
 def build_jp_confirmation_message(commande: Commande) -> str:
-    from .order_confirmation import (
-        _is_tiktok_queue_commande,
-        _order_is_eligible,
-        _tiktok_queue_position,
-        ensure_tiktok_turn_started,
-        get_jp_turn_timeout_minutes,
-    )
+    from .order_confirmation import _order_is_eligible
 
-    # ——— TikTok : file FIFO + lien public (pas de collecte Messenger) ———
-    if _is_tiktok_queue_commande(commande):
-        ensure_tiktok_turn_started(commande)
-        client = commande.client
-        produit = commande.produit
-        hello = greeting(client.nom)
-        link = public_order_form_url(commande.live_id) if commande.live_id else ''
-        position, ahead = _tiktok_queue_position(commande)
-        timeout = get_jp_turn_timeout_minutes()
-
-        intro = pick(
-            [
-                f"{hello} 😊 Voaray ny JP-nao ho an'ny '{produit.nom}'.",
-                f"{hello}! Efa azonay ny JP-nao ho an'ny '{produit.nom}'.",
-            ]
-        )
-        if ahead == 0:
-            tour = (
-                f"Anjaranao izao (1er). Manana {timeout} minitra ianao hanamafisana "
-                f"ny commande (isa + infos)."
-            )
-        else:
-            tour = (
-                f"Ao amin'ny liste d'attente ianao (numéro {position}, "
-                f"{ahead} olona eo alohanao). Miandry ny anjaranao."
-            )
-        action = (
-            f"Sokafy ity rohy confirmation ity : {link}"
-            if link
-            else "Sokafy ny rohy confirmation nomen'ny mpividy."
-        )
-        return f'{intro} {tour} {action}{emoji(prob=0.4)}'
-
-    # ——— Facebook / Messenger : logique historique inchangée ———
     client = commande.client
     produit = commande.produit
     hello = greeting(client.nom)
@@ -318,10 +278,9 @@ def send_completion_request_message(commande: Commande, missing_fields: list[str
 
 
 def build_waiting_with_info_message(commande: Commande) -> str:
-    """Le client a tout fourni mais reste en liste d'attente (stock pas encore dispo)."""
+    """Le client a tout fourni mais reste en liste d'attente (quelqu'un devant lui)."""
     client = commande.client
     produit = commande.produit
-    fn = first_name(client.nom)
     intro = pick(
         [
             f"{thanks_with_name(client.nom)}! Voaray daholo ny infos-nao ho an'ny '{produit.nom}'.",

@@ -308,6 +308,14 @@ AZLIVE_PUBLIC_ORDER_BASE_URL = os.environ.get(
 TIKTOOL_API_KEY = os.environ.get('TIKTOOL_API_KEY', '')
 # Pause après un close WS 4429 (quota Sandbox). Pendant ce temps, détection via REST.
 TIKTOOL_WS_COOLDOWN_SECONDS = float(os.environ.get('TIKTOOL_WS_COOLDOWN_SECONDS', '3600'))
+# Consommation WS :
+#   on_demand (défaut) = REST détecte le live, WS ouvert seulement pendant un live
+#   always             = scout WS permanent (plus réactif, brûle le quota Sandbox)
+TIKTOOL_WS_MODE = os.environ.get('TIKTOOL_WS_MODE', 'on_demand').strip().lower()
+# Pool : nombre max de WebSockets TikTools OUVERTS en même temps.
+# Sandbox ≈ 3 streams simultanés → défaut 2 (marge de sécurité).
+# En prod (Basic/Pro) : monter à 10 / 20 / 50 selon le plan TikTools.
+TIKTOOL_WS_MAX_CONNECTIONS = int(os.environ.get('TIKTOOL_WS_MAX_CONNECTIONS', '2'))
 # true = le vendeur doit cliquer « Activer capture JP » pour ouvrir le WS
 # (recommandé avec on_demand pour économiser le quota).
 TIKTOOL_WS_MANUAL_CAPTURE = os.environ.get('TIKTOOL_WS_MANUAL_CAPTURE', 'true').strip().lower() in {
