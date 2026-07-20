@@ -1014,9 +1014,7 @@ def claim_masked_facebook_client(
             statut=Commande.STATUT_JP_CAPTURE,
             client__facebook_id__startswith='fb_comment:',
         )
-        # Le plus ancien JP masqué d'abord : le 1er commentateur (Ando) doit récupérer
-        # son fil, pas le dernier masqué créé ensuite.
-        .order_by('ordre_jp', 'date_creation')
+        .order_by('-date_creation')
     )
     if vendeur:
         queryset = queryset.filter(produit__vendeur=vendeur)
@@ -1059,16 +1057,26 @@ def find_cancellable_commande(client: Client, vendeur: Vendeur | None = None) ->
 
 
 def _stock_remaining_for(commande: Commande) -> int | None:
-    """Stock visible pour cette commande (0 si ce n'est pas encore son tour).
+    """Stock encore disponible pour cette commande (après file JP devant elle).
 
     None = pas de variante / stock non applicable (éligible par défaut).
+    La file « devant » est limitée au même live quand possible.
     """
     variante = commande._get_stock_variante()
     if not variante:
         return None
-    if _has_pending_ahead(commande):
-        return 0
-    return max(int(variante.stock), 0)
+
+    ahead = Commande.objects.filter(
+        produit=commande.produit,
+        variante=commande.variante,
+        statut=Commande.STATUT_JP_CAPTURE,
+        ordre_jp__lt=commande.ordre_jp,
+    ).exclude(pk=commande.pk)
+    if commande.live_id:
+        ahead = ahead.filter(live_id=commande.live_id)
+
+    qty_ahead = sum(c.quantite_effective for c in ahead)
+    return max(variante.stock - qty_ahead, 0)
 
 
 def cancel_commande_public(commande: Commande) -> dict[str, Any]:
@@ -1350,8 +1358,8 @@ def reopen_after_cancel(cancelled: Commande) -> dict[str, Any]:
     if cancelled.statut != Commande.STATUT_ANNULE:
         raise OrderConfirmationError('Cette commande n\'est pas annulée.', status_code=409)
 
-    # Déjà un JP ouvert sur la même déclinaison *et le même contexte* → on le réutilise.
-    existing_qs = (
+    # Déjà un JP ouvert sur la même déclinaison → on le réutilise.
+    existing = (
         Commande.objects.select_for_update()
         .filter(
             client=cancelled.client,
@@ -1359,31 +1367,25 @@ def reopen_after_cancel(cancelled: Commande) -> dict[str, Any]:
             variante=cancelled.variante,
             statut=Commande.STATUT_JP_CAPTURE,
         )
+        .order_by('ordre_jp')
+        .first()
     )
-    if cancelled.live_id:
-        existing_qs = existing_qs.filter(live_id=cancelled.live_id)
-    else:
-        existing_qs = existing_qs.filter(live__isnull=True)
-    existing = existing_qs.order_by('ordre_jp').first()
     if existing:
         commande = existing
     else:
         max_order = (
             Commande.objects.select_for_update()
             .filter(produit=cancelled.produit, variante=cancelled.variante)
+            .aggregate(max_ordre=Max('ordre_jp'))['max_ordre']
+            or 0
         )
-        if cancelled.live_id:
-            max_order = max_order.filter(live_id=cancelled.live_id)
-        else:
-            max_order = max_order.filter(live__isnull=True)
-        max_ordre = max_order.aggregate(max_ordre=Max('ordre_jp'))['max_ordre'] or 0
         commande = Commande.objects.create(
             client=cancelled.client,
             produit=cancelled.produit,
             variante=cancelled.variante,
             live=cancelled.live,
             quantite=cancelled.quantite,
-            ordre_jp=max_ordre + 1,
+            ordre_jp=max_order + 1,
             statut=Commande.STATUT_JP_CAPTURE,
         )
 
@@ -1598,45 +1600,153 @@ def _is_quantity_line(line: str) -> bool:
     )
 
 
-def _queue_scope_filter(queryset, live):
-    """Isole la file d'attente : un live (ou les articles hors-live) ne croise pas les autres."""
-    if live is not None:
-        live_id = getattr(live, 'pk', live)
-        return queryset.filter(live_id=live_id)
-    return queryset.filter(live__isnull=True)
-
-
 def _has_pending_ahead(commande: Commande) -> bool:
-    """True s'il reste un JP devant celui-ci (file FIFO stricte, même live / article)."""
-    queryset = Commande.objects.filter(
+    """True s'il reste un JP devant celui-ci (file FIFO stricte, canal Facebook)."""
+    return (
+        Commande.objects.filter(
+            produit=commande.produit,
+            variante=commande.variante,
+            statut=Commande.STATUT_JP_CAPTURE,
+            ordre_jp__lt=commande.ordre_jp,
+        )
+        .exclude(pk=commande.pk)
+        .exists()
+    )
+
+
+def _available_stock_for_commande(commande: Commande) -> int:
+    """Stock réellement disponible pour cette commande (après les JP devant elle)."""
+    variante = commande._get_stock_variante()
+    if not variante:
+        return 10**9
+    remaining = max(0, int(variante.stock))
+    ahead = Commande.objects.filter(
         produit=commande.produit,
         variante=commande.variante,
         statut=Commande.STATUT_JP_CAPTURE,
         ordre_jp__lt=commande.ordre_jp,
     ).exclude(pk=commande.pk)
-    return _queue_scope_filter(queryset, commande.live).exists()
+    qty_ahead = sum(c.quantite_effective for c in ahead)
+    return max(0, remaining - qty_ahead)
 
 
-def _available_stock_for_commande(commande: Commande) -> int:
-    """Stock utilisable pour cette commande : uniquement à son tour (tête de file).
+def _is_tiktok_queue_commande(commande: Commande) -> bool:
+    """Commande suivie par la file FIFO TikTok (pas Messenger Facebook)."""
+    client = getattr(commande, 'client', None)
+    if client is None:
+        return False
+    return bool(client.tiktok_id and not client.facebook_id and commande.live_id)
 
-    Tant qu'un JP devant est encore ouvert, le client n'a pas la main — même s'il
-    resterait du stock « en théorie » après la quantité du premier.
-    """
-    if _has_pending_ahead(commande):
-        return 0
+
+def _tiktok_queue_queryset(produit, variante=None):
+    return (
+        Commande.objects.select_related('client', 'produit', 'variante', 'live')
+        .filter(produit=produit, variante=variante, statut=Commande.STATUT_JP_CAPTURE)
+        .order_by('ordre_jp', 'id')
+    )
+
+
+def _tiktok_head_of_queue(produit, variante=None) -> Commande | None:
+    return _tiktok_queue_queryset(produit, variante).first()
+
+
+def _tiktok_is_head_of_queue(commande: Commande) -> bool:
+    head = _tiktok_head_of_queue(commande.produit, commande.variante)
+    return head is not None and head.pk == commande.pk
+
+
+def _tiktok_raw_stock(commande: Commande) -> int:
     variante = commande._get_stock_variante()
     if not variante:
         return 10**9
     return max(0, int(variante.stock))
 
 
+def _tiktok_queue_position(commande: Commande) -> tuple[int, int]:
+    """Retourne (position 1-based, nombre de personnes devant)."""
+    ahead = Commande.objects.filter(
+        produit=commande.produit,
+        variante=commande.variante,
+        statut=Commande.STATUT_JP_CAPTURE,
+        ordre_jp__lt=commande.ordre_jp,
+    ).count()
+    return ahead + 1, ahead
+
+
+def get_jp_turn_timeout_minutes() -> int:
+    from .models import ParametresPlateforme
+
+    minutes = int(ParametresPlateforme.get_current().jp_turn_timeout_minutes or 5)
+    return max(1, minutes)
+
+
+def ensure_tiktok_turn_started(commande: Commande) -> Commande:
+    """Marque le début du tour si la commande est en tête de file TikTok."""
+    if not _is_tiktok_queue_commande(commande):
+        return commande
+    if not _tiktok_is_head_of_queue(commande):
+        return commande
+    if commande.turn_started_at is None:
+        commande.turn_started_at = timezone.now()
+        commande.save(update_fields=['turn_started_at'])
+    return commande
+
+
+def expire_timed_out_tiktok_turns(*, produit=None, variante=None) -> list[int]:
+    """Expire les têtes de file TikTok dont le timeout est dépassé → promote auto."""
+    timeout = timedelta(minutes=get_jp_turn_timeout_minutes())
+    now = timezone.now()
+    expired_ids: list[int] = []
+
+    qs = Commande.objects.filter(
+        statut=Commande.STATUT_JP_CAPTURE,
+        turn_started_at__isnull=False,
+        client__tiktok_id__isnull=False,
+    ).filter(
+        models.Q(client__facebook_id__isnull=True) | models.Q(client__facebook_id='')
+    ).select_related('client', 'produit', 'variante')
+
+    if produit is not None:
+        qs = qs.filter(produit=produit)
+    if variante is not None:
+        qs = qs.filter(variante=variante)
+
+    # Une seule tête par (produit, variante) : on traite les turn_started les plus anciens.
+    seen_keys: set[tuple[int, int | None]] = set()
+    for commande in qs.order_by('turn_started_at'):
+        if not _is_tiktok_queue_commande(commande):
+            continue
+        key = (commande.produit_id, commande.variante_id)
+        if key in seen_keys:
+            continue
+        if not _tiktok_is_head_of_queue(commande):
+            continue
+        seen_keys.add(key)
+        if commande.turn_started_at and commande.turn_started_at + timeout <= now:
+            result = expire_commande(commande)
+            if result:
+                expired_ids.append(commande.id)
+                logger.info(
+                    'Timeout tour TikTok commande #%s (timeout=%s min) → suivante promu',
+                    commande.id,
+                    get_jp_turn_timeout_minutes(),
+                )
+    return expired_ids
+
+
 def _order_is_eligible(commande: Commande) -> bool:
-    """Vrai si c'est son tour (personne devant) et qu'il reste assez de stock."""
-    return (
-        not _has_pending_ahead(commande)
-        and _available_stock_for_commande(commande) >= commande.quantite_effective
-    )
+    """Vrai si la commande peut être confirmée maintenant.
+
+    - TikTok (file FIFO) : uniquement la tête de file + stock brut suffisant.
+    - Facebook / autres : logique historique (soft stock après les JP devant).
+    """
+    if _is_tiktok_queue_commande(commande):
+        if not _tiktok_is_head_of_queue(commande):
+            return False
+        return _tiktok_raw_stock(commande) >= commande.quantite_effective
+
+    return _available_stock_for_commande(commande) >= commande.quantite_effective
+
 
 ACCEPT_PARTIAL_PATTERNS = [
     re.compile(r'\b(?:oui|ok|oka|eken[ao]?|eka|prend|prends|prendre|alaina|alaiko|tonga)\b', re.I),
@@ -1743,44 +1853,35 @@ def _client_fields_as_collected(client: Client) -> dict[str, str]:
     return collected
 
 
-def _merge_collected_fields(*sources: dict[str, str], later_wins: bool = False) -> dict[str, str]:
-    """Fusionne des dicts de champs.
-
-    Par défaut le premier non vide gagne. Avec ``later_wins=True`` (reprise + corrections),
-    les sources suivantes écrasent les précédentes.
-    """
+def _merge_collected_fields(*sources: dict[str, str]) -> dict[str, str]:
     merged: dict[str, str] = {}
     for source in sources:
         for key, value in source.items():
-            if not value:
-                continue
-            if later_wins or not merged.get(key):
+            if value and not merged.get(key):
                 merged[key] = value
     return merged
 
 
 def _cancelled_predecessor_for_reprise(commande: Commande) -> Commande | None:
-    """Commande annulée récente dont on reprend les infos (même client / déclinaison / contexte)."""
+    """Commande annulée récente dont on reprend les infos (même client / déclinaison)."""
     from django.conf import settings
 
     if not commande.pk:
         return None
     max_hours = getattr(settings, 'AZLIVE_REPRISE_INFO_MAX_HOURS', 72)
     cutoff = timezone.now() - timedelta(hours=max_hours)
-    predecessor_qs = Commande.objects.filter(
-        client=commande.client,
-        produit=commande.produit,
-        variante=commande.variante,
-        statut=Commande.STATUT_ANNULE,
-        date_creation__lt=commande.date_creation,
-        date_creation__gte=cutoff,
+    predecessor = (
+        Commande.objects.filter(
+            client=commande.client,
+            produit=commande.produit,
+            variante=commande.variante,
+            statut=Commande.STATUT_ANNULE,
+            date_creation__lt=commande.date_creation,
+            date_creation__gte=cutoff,
+        )
+        .order_by('-date_creation')
+        .first()
     )
-    # Live et article restent isolés : pas d'héritage croisé des infos livraison.
-    if commande.live_id:
-        predecessor_qs = predecessor_qs.filter(live_id=commande.live_id)
-    else:
-        predecessor_qs = predecessor_qs.filter(live__isnull=True)
-    predecessor = predecessor_qs.order_by('-date_creation').first()
     if predecessor and _predecessor_had_complete_infos(predecessor):
         return predecessor
     return None
@@ -1813,8 +1914,7 @@ def _effective_collected_fields(commande: Commande) -> dict[str, str]:
         return collected
     predecessor = _cancelled_predecessor_for_reprise(commande)
     inherited_thread = _fields_from_commande_inbounds(predecessor) if predecessor else {}
-    # Les corrections du nouveau fil (hanova adresse …) écrasent l'héritage.
-    return _merge_collected_fields(inherited_thread, collected, later_wins=True)
+    return _merge_collected_fields(inherited_thread, collected)
 
 
 def _has_reprise_confirmation_ack(commande: Commande) -> bool:
@@ -1840,14 +1940,11 @@ def _reprise_has_info_update(parsed_data: dict[str, str], inbound_text: str) -> 
 
 
 class _ThreadPartialClient:
-    """État cumulé du fil MP uniquement — jamais l'ancien profil Client.
 
-    Si on pré-remplit ``nom`` depuis le Client, la relecture du message qui a fourni
-    ce nom le reclasse en adresse (nom déjà « connu »).
-    """
-
-    def __init__(self, base: Client | None = None):
-        self.nom = ''
+    def __init__(self, base: Client):
+        self.nom = (
+            base.nom if base.nom and base.nom not in _CLIENT_PLACEHOLDER_NAMES else ''
+        )
         self.telephone = ''
         self.adresse = ''
         self.date_livraison_preferee = None
@@ -1871,51 +1968,11 @@ def _apply_thread_field(partial: _ThreadPartialClient, key: str, value: str) -> 
             partial.heure_livraison_preferee = delivery_time
 
 
-def _is_non_info_inbound(text: str) -> bool:
-    """Messages de contrôle (reprise, eka, annulation…) — pas des infos livraison."""
-    cleaned = (text or '').strip()
-    if not cleaned:
-        return True
-    if _looks_like_reprise(cleaned):
-        return True
-    if _looks_like_confirmation_ack(cleaned):
-        return True
-    if _is_cancellation(cleaned):
-        return True
-    if _is_modification_cancellation(cleaned):
-        return True
-    if _looks_like_thanks(cleaned):
-        return True
-    return False
-
-
 def _fields_from_commande_inbounds(commande: Commande) -> dict[str, str]:
     """Champs explicitement fournis dans les MP entrants de cette commande."""
     merged: dict[str, str] = {}
     partial = _ThreadPartialClient(commande.client)
     for msg in commande.messages.filter(direction=Message.DIRECTION_INBOUND).order_by('date_envoi', 'id'):
-        if _is_non_info_inbound(msg.contenu):
-            continue
-        if _looks_like_modification(msg.contenu):
-            mod_fields = _extract_modification_fields(msg.contenu)
-            for key, value in mod_fields.items():
-                if key == '_quantite' or not value:
-                    continue
-                merged[key] = value
-                _apply_thread_field(partial, key, value)
-            # Compléter avec un parse libre (sans écraser les champs « hanova … »,
-            # et sans prendre « hanova » / la phrase entière pour le nom).
-            parsed = analyze_confirmation_message(msg.contenu, client=partial)
-            for key in _ORDER_THREAD_FIELD_KEYS:
-                if not parsed.get(key) or key in merged:
-                    continue
-                if key == 'nom' and (
-                    _looks_like_modification(parsed[key]) or _looks_like_modification(msg.contenu)
-                ):
-                    continue
-                merged[key] = parsed[key]
-                _apply_thread_field(partial, key, parsed[key])
-            continue
         parsed = analyze_confirmation_message(msg.contenu, client=partial)
         for key in _ORDER_THREAD_FIELD_KEYS:
             if parsed.get(key):
@@ -2346,12 +2403,17 @@ def handle_client_reply(
         )
         if will_update and is_reprise_pending:
             _save_modification_snapshot(commande, client, commande.quantite)
+        _apply_parsed_fields(client, parsed_data)
 
-    # Source de vérité = fil MP (ré-analysé). Ne pas écrire parsed_data sur le Client
-    # avant : ça ferait partir _ThreadPartialClient avec le nouveau nom et reclasserait
-    # la même ligne « Lova » en adresse.
-    _sync_client_from_thread(commande)
-    client.refresh_from_db()
+    client.save(
+        update_fields=[
+            'nom',
+            'telephone',
+            'adresse',
+            'date_livraison_preferee',
+            'heure_livraison_preferee',
+        ],
+    )
 
     # Quantité : demandée pendant la collecte (pas dans le JP). On n'accepte un nombre
     # « nu » que tant qu'on attend justement la quantité.
@@ -2487,9 +2549,12 @@ def _waiting_list_result(
     if commande.statut == Commande.STATUT_CONFIRME:
         return _already_confirmed_result(commande, parsed_data=parsed_data)
 
-    stock = available if available is not None else _available_stock_for_commande(commande)
-    # Tête de file mais plus de stock → message « lany ny X… », pas la file d'attente.
-    sold_out = not _has_pending_ahead(commande) and stock <= 0
+    if _is_tiktok_queue_commande(commande):
+        stock = available if available is not None else _tiktok_raw_stock(commande)
+        sold_out = _tiktok_is_head_of_queue(commande) and stock <= 0
+    else:
+        stock = available if available is not None else _available_stock_for_commande(commande)
+        sold_out = not _has_pending_ahead(commande) and stock <= 0
 
     if sold_out:
         from .order_messaging import send_sold_out_message
@@ -2533,13 +2598,12 @@ def _finalize_confirmation(
     promoted=True quand la confirmation vient d'une montée en file (une place s'est libérée
     et les informations du client étaient déjà complètes) : le message le signale.
 
-    Sous verrou : re-vérifie l'éligibilité pour éviter qu'un 2ᵉ client confirme pendant
-    que le 1ᵉr passe à « confirmé » mais avant que le stock soit réservé.
-
-    promote_next=True : après confirmation, avance la file (le suivant complet peut
-    confirmer s'il reste du stock). Désactivé quand on est déjà dans promote_queue.
+    Sous verrou : re-vérifie l'éligibilité pour éviter les courses Facebook.
+    promote_next=True : après confirmation, avance la file (désactivé dans promote_queue).
     """
     with transaction.atomic():
+        # of=('self',) : Postgres refuse FOR UPDATE sur le côté nullable d'un OUTER JOIN
+        # (variante / live sont null=True → select_related génère LEFT OUTER JOIN).
         locked = (
             Commande.objects.select_for_update(of=('self',))
             .select_related('client', 'produit', 'variante', 'live')
@@ -2596,14 +2660,8 @@ def _finalize_confirmation(
             'etiquette_url': outbound.get('etiquette_url'),
         }
 
-    # Hors du verrou commande : enchaîne sur le suivant (FIFO).
     if promote_next and result.get('complet'):
-        promote_queue(
-            locked.produit,
-            variante=locked.variante,
-            exclude_pk=locked.pk,
-            live=locked.live,
-        )
+        promote_queue(locked.produit, variante=locked.variante, exclude_pk=locked.pk)
 
     return result
 
@@ -2631,7 +2689,7 @@ def expire_commande(commande: Commande) -> dict[str, Any] | None:
     }
 
 
-def promote_queue(produit, variante=None, exclude_pk=None, live=None) -> None:
+def promote_queue(produit, variante=None, exclude_pk=None) -> None:
     """Fait avancer la file d'attente d'une déclinaison après libération de stock/place.
 
     Confirme automatiquement les commandes suivantes qui sont à la fois ÉLIGIBLES (stock)
@@ -2642,20 +2700,27 @@ def promote_queue(produit, variante=None, exclude_pk=None, live=None) -> None:
     Si le stock restant est > 0 mais insuffisant pour la quantité demandée, on propose
     de prendre le reste (le client répond oui / miandry) et on s'arrête.
 
-    La file est isolée par live (ou hors-live / article) : pas de croisement.
+    TikTok : pas d'auto-confirm — ouvre le tour (turn_started_at) et notifie de rouvrir le lien.
     """
     while True:
         queryset = (
-            Commande.objects.select_related('client', 'produit', 'variante', 'live')
+            Commande.objects.select_related('client', 'produit', 'variante')
             .filter(produit=produit, variante=variante, statut=Commande.STATUT_JP_CAPTURE)
             .order_by('ordre_jp')
         )
-        queryset = _queue_scope_filter(queryset, live)
         if exclude_pk:
             queryset = queryset.exclude(pk=exclude_pk)
 
         commande = queryset.first()
         if commande is None:
+            return
+
+        # TikTok FIFO : ouvrir le tour du suivant, notifier, ne pas auto-confirmer.
+        if _is_tiktok_queue_commande(commande):
+            ensure_tiktok_turn_started(commande)
+            from .order_messaging import send_public_form_spot_available_message
+
+            send_public_form_spot_available_message(commande)
             return
 
         available = _available_stock_for_commande(commande)
@@ -2682,21 +2747,11 @@ def promote_queue(produit, variante=None, exclude_pk=None, live=None) -> None:
             send_stock_partial_offer_message(commande, available)
             return
 
-        # TikTok (formulaire public) : ne pas auto-confirmer.
-        # Le client rouvre /commander/<live> et clique sur Confirmer.
-        client = commande.client
-        if client.tiktok_id and not client.facebook_id and commande.live_id:
-            from .order_messaging import send_public_form_spot_available_message
-
-            send_public_form_spot_available_message(commande)
-            return
-
+        # Messenger / autres canaux : confirmation automatique si infos déjà complètes.
         result = _finalize_confirmation(commande, promoted=True, promote_next=False)
         if not result.get('complet'):
-            # Course sur le stock : plus éligible au moment du verrou — on s'arrête.
             return
-        # Sinon on continue : une confirmation peut libérer la place suivante
-        # uniquement si stock > 1 ; sinon le prochain tour verra available <= 0.
+        # Continue si stock > 1 : le prochain tour peut confirmer le suivant.
 
 
 @transaction.atomic
@@ -2763,15 +2818,13 @@ def process_inbound_private_message(
                             'commande_id': commande.id,
                             'message_client': outbound.get('content'),
                         }
-                    # Infos déjà dans le fil de CETTE commande : confirmer sans réinjecter
-                    # l'ancien profil client (livraison d'un autre live/article).
-                    _sync_client_from_thread(commande)
-                    return handle_client_reply(
-                        commande,
-                        {},
-                        inbound_text='oka',
-                        canal=channel,
-                    )
+                    # Infos déjà là : retraiter comme une confirmation.
+                    message_text = (
+                        f"{client.nom}\n{client.telephone}\n{client.adresse}\n"
+                        f"{client.date_livraison_preferee}\n"
+                        f"{client.heure_livraison_preferee.strftime('%H:%M') if client.heure_livraison_preferee else ''}\n"
+                        f"{commande.quantite or ''}"
+                    ).strip()
 
     if not message_text:
         raise OrderConfirmationError('Message privé vide ou expéditeur manquant.')
@@ -2923,7 +2976,10 @@ def process_inbound_private_message(
             Commande.STATUT_CONFIRME,
             Commande.STATUT_PREPARE,
         ):
-            parsed = analyze_confirmation_message(message_text, client=client)
+            parsed = analyze_confirmation_message(
+                message_text,
+                client=_analyzer_client_for_commande(commande),
+            )
             return handle_client_reply(
                 commande,
                 parsed,
@@ -2966,18 +3022,18 @@ def process_inbound_private_message(
                 canal=channel,
             )
         commande = find_cancellable_commande(client, vendeur=vendeur)
-        parsed = analyze_confirmation_message(message_text, client=client)
-        if (
-            commande
-            and commande.statut in (Commande.STATUT_CONFIRME, Commande.STATUT_PREPARE)
-            and _parsed_has_updatable_fields(parsed)
-        ):
-            return handle_client_reply(
-                commande,
-                parsed,
-                inbound_text=message_text,
-                canal=channel,
+        if commande and commande.statut in (Commande.STATUT_CONFIRME, Commande.STATUT_PREPARE):
+            parsed = analyze_confirmation_message(
+                message_text,
+                client=_analyzer_client_for_commande(commande),
             )
+            if _parsed_has_updatable_fields(parsed):
+                return handle_client_reply(
+                    commande,
+                    parsed,
+                    inbound_text=message_text,
+                    canal=channel,
+                )
         raise OrderConfirmationError(
             'Aucune commande JP en attente de confirmation pour ce client.',
             status_code=404,
@@ -3021,7 +3077,7 @@ def process_inbound_private_message(
 
     parsed = analyze_confirmation_message(
         message_text,
-        client=_analyzer_client_for_commande(commande),
+        client=_analyzer_client_for_commande(commande) if commande else client,
     )
 
     # Infos de livraison : priorité absolue sur human_assistance (régression post-pull).

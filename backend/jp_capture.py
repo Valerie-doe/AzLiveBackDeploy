@@ -78,6 +78,12 @@ def create_jp_commande(client, produit, live=None, canal='', comment_id=None, va
                 live=live,
             )
 
+    # TikTok FIFO : si cette commande est en tête, démarre le chronomètre du tour.
+    if not reused and live is not None and client.tiktok_id and not client.facebook_id:
+        from .order_confirmation import ensure_tiktok_turn_started
+
+        ensure_tiktok_turn_started(commande)
+
     if not reused:
         send_jp_confirmation_message(commande, comment_id=comment_id)
     return commande

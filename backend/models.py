@@ -52,6 +52,12 @@ class ParametresPlateforme(models.Model):
         help_text="Taux de commission prélevé par la plateforme (ex: 0.10 = 10%)"
     )
     nom_plateforme = models.CharField(max_length=100, default='AZLive')
+    # Délai max pour confirmer quand c'est le tour du client (file JP TikTok).
+    jp_turn_timeout_minutes = models.PositiveIntegerField(
+        default=5,
+        help_text="Timeout (minutes) pour confirmer une commande TikTok quand c'est son tour. "
+                  "Passé ce délai, le JP expire et le suivant passe.",
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -239,6 +245,8 @@ class Commande(models.Model):
     quantite = models.PositiveIntegerField(null=True, blank=True, default=None)
     statut = models.CharField(max_length=50, choices=STATUT_CHOICES, default=STATUT_JP_CAPTURE)
     date_creation = models.DateTimeField(auto_now_add=True)
+    # Début du tour (tête de file TikTok) — sert au timeout de confirmation.
+    turn_started_at = models.DateTimeField(null=True, blank=True)
     live = models.ForeignKey(Live, on_delete=models.SET_NULL, null=True, blank=True, related_name='commandes')
     variante = models.ForeignKey(Variante, on_delete=models.SET_NULL, null=True, blank=True, related_name='commandes')
 
@@ -254,7 +262,7 @@ class Commande(models.Model):
         """Une place s'est libérée : avance la file (confirme les suivants complets, sinon relance)."""
         from .order_confirmation import promote_queue
 
-        promote_queue(self.produit, variante=self.variante, exclude_pk=self.pk, live=self.live)
+        promote_queue(self.produit, variante=self.variante, exclude_pk=self.pk)
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
@@ -272,9 +280,7 @@ class Commande(models.Model):
             old_status == self.STATUT_CONFIRME and self.statut == self.STATUT_ANNULE
         )
 
-        # Réserver / libérer le stock AVANT de publier le statut.
-        # Sinon un concurrent peut lire « confirmé » alors que le stock est encore plein
-        # et confirmer à tort le suivant (facture), puis lui renvoyer une liste d'attente.
+        # Réserver / libérer le stock AVANT de publier le statut (évite courses Facebook).
         if to_confirm:
             self._adjust_variante_stock(-self.quantite_effective, required=True)
         elif from_confirm_to_cancel:
@@ -315,8 +321,11 @@ class Commande(models.Model):
     def get_prix_unitaire(self):
         if self.variante_id:
             return self.variante.prix_unitaire
-        first = self.produit.variantes.order_by('id').first()
-        return first.prix_unitaire if first else 0
+        # .all() (plutôt que .order_by().first()) permet de réutiliser le cache
+        # prefetch_related('produit__variantes') quand il existe, évitant une
+        # requête SQL supplémentaire par commande sur les vues liste.
+        variantes = sorted(self.produit.variantes.all(), key=lambda v: v.id)
+        return variantes[0].prix_unitaire if variantes else 0
 
     def get_prix_total(self):
         return self.get_prix_unitaire() * self.quantite_effective
@@ -324,11 +333,11 @@ class Commande(models.Model):
     def delete(self, *args, **kwargs):
         if self.statut == self.STATUT_CONFIRME:
             self._adjust_variante_stock(self.quantite_effective)
-        produit, variante, pk, live = self.produit, self.variante, self.pk, self.live
+        produit, variante, pk = self.produit, self.variante, self.pk
         super().delete(*args, **kwargs)
         from .order_confirmation import promote_queue
 
-        promote_queue(produit, variante=variante, exclude_pk=pk, live=live)
+        promote_queue(produit, variante=variante, exclude_pk=pk)
 
     def __str__(self):
         return f"Commande #{self.pk} - {self.client.nom} - {self.produit.nom}"
